@@ -1,4 +1,4 @@
-# QueryDF.jl
+# QuackSQL.jl
 
 A Julia library for querying tabular data sources—DataFrames, CSV files,
 Parquet files, and DuckDB databases—using standard SQL, powered by
@@ -10,7 +10,7 @@ Parquet files, and DuckDB databases—using standard SQL, powered by
 
 ```julia
 using Pkg
-Pkg.add(path="path/to/QueryDF.jl")   # local checkout
+Pkg.add(path="path/to/QuackSQL.jl")   # local checkout
 ```
 
 ---
@@ -18,7 +18,7 @@ Pkg.add(path="path/to/QueryDF.jl")   # local checkout
 ## Quick start
 
 ```julia
-using QueryDF, DataFrames
+using QuackSQL, DataFrames
 
 # ── 1. Simplest usage — one-shot query ───────────────────────────────────────
 with_context() do ctx
@@ -224,7 +224,7 @@ plan = explain(ctx, sql; analyze=true)
 
 ## Logging
 
-QueryDF uses Julia's standard `Logging` module.  By default only warnings and
+QuackSQL uses Julia's standard `Logging` module.  By default only warnings and
 errors are emitted.  Enable verbose output with:
 
 ```julia
@@ -257,11 +257,11 @@ df  = execute(ctx, "SELECT * FROM table_that_might_not_exist")
 ## File structure
 
 ```
-QueryDF.jl/
+QuackSQL.jl/
 ├── Project.toml
 ├── README.md
 ├── src/
-│   ├── QueryDF.jl      # module, exports
+│   ├── QuackSQL.jl      # module, exports
 │   ├── types.jl        # QueryError, QueryResult
 │   ├── config.jl       # QueryConfig, DuckDB connection helpers
 │   ├── pool.jl         # ConnectionPool

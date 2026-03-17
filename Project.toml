@@ -1,4 +1,4 @@
-name = "QueryDF"
+name = "QuackSQL"
 uuid = "a4e3c8a1-d2f0-4b3e-9c5f-7a6b2e1d0f8c"
 authors = ["Anand Bisen <asbisen@icloud.com>"]
 version = "0.1.0"

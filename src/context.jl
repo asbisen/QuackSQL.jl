@@ -20,7 +20,7 @@
 """
     QueryContext
 
-The central state object for QueryDF.  Create it once, register your sources,
+The central state object for QuackSQL.  Create it once, register your sources,
 then execute as many queries as you need.
 
 ```julia

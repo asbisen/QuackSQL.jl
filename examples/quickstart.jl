@@ -1,18 +1,18 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# QueryDF — Quick-start examples
-# Run from the QueryDF.jl/ directory: julia --project examples/quickstart.jl
+# QuackSQL — Quick-start examples
+# Run from the QuackSQL.jl/ directory: julia --project examples/quickstart.jl
 # ─────────────────────────────────────────────────────────────────────────────
 
-using QueryDF
+using QuackSQL
 using DataFrames
 using Logging
 using Dates
 
-# Optional: see debug messages from QueryDF
+# Optional: see debug messages from QuackSQL
 # Logging.global_logger(ConsoleLogger(stderr, Logging.Debug))
 
 println("=" ^ 60)
-println("  QueryDF Quick-start")
+println("  QuackSQL Quick-start")
 println("=" ^ 60)
 
 # ── 1. Simplest possible usage ────────────────────────────────────────────────

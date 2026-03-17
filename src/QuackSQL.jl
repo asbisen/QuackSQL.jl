@@ -1,5 +1,5 @@
 """
-    QueryDF
+    QuackSQL
 
 A Julia library for querying tabular data sources—`DataFrame`s, CSV files,
 Parquet files, and DuckDB databases—using standard SQL via DuckDB.
@@ -7,7 +7,7 @@ Parquet files, and DuckDB databases—using standard SQL via DuckDB.
 # Quick start
 
 ```julia
-using QueryDF, DataFrames
+using QuackSQL, DataFrames
 
 # ── In-memory work ──────────────────────────────────────────────────────────
 ctx = QueryContext()                         # or QueryContext(":memory:")
@@ -58,14 +58,14 @@ close!(pool)
 
 # Logging
 
-QueryDF uses Julia's standard `Logging` module.  Enable debug output with:
+QuackSQL uses Julia's standard `Logging` module.  Enable debug output with:
 
 ```julia
 using Logging
 Logging.global_logger(ConsoleLogger(stderr, Logging.Debug))
 ```
 """
-module QueryDF
+module QuackSQL
 
 using DuckDB
 using DataFrames
@@ -101,4 +101,4 @@ export register!, deregister!, list_sources
 # Query execution
 export execute, execute!, query, transaction, stream, explain
 
-end # module QueryDF
+end # module QuackSQL

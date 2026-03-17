@@ -1,4 +1,4 @@
-using QueryDF
+using QuackSQL
 using DataFrames
 using Test
 using Dates
@@ -8,7 +8,7 @@ using Logging
 # Silence debug/info logs during tests
 global_logger(ConsoleLogger(stderr, Logging.Warn))
 
-@testset "QueryDF.jl" begin
+@testset "QuackSQL.jl" begin
 
     # ── QueryConfig ───────────────────────────────────────────────────────────
     @testset "QueryConfig defaults" begin
@@ -360,7 +360,7 @@ global_logger(ConsoleLogger(stderr, Logging.Warn))
 
     # ParquetSource struct tests need no files — they don't create a context.
     @testset "ParquetSource struct" begin
-        using QueryDF: ParquetSource
+        using QuackSQL: ParquetSource
         src = ParquetSource("data/*.parquet", true)
         @test src.path == "data/*.parquet"
         @test src.union_by_name == true
@@ -380,7 +380,7 @@ global_logger(ConsoleLogger(stderr, Logging.Warn))
     # All remaining tests need real parquet files because DuckDB validates
     # glob patterns eagerly when CREATE OR REPLACE VIEW is executed.
     @testset "union_by_name integration" begin
-        using QueryDF: ParquetSource
+        using QuackSQL: ParquetSource
 
         tmp_dir = mktempdir()
         pq1  = joinpath(tmp_dir, "part1.parquet")
@@ -507,7 +507,7 @@ global_logger(ConsoleLogger(stderr, Logging.Warn))
 
     # ── _needs_sanitization helper ────────────────────────────────────────────
     @testset "_needs_sanitization" begin
-        using QueryDF: _needs_sanitization
+        using QuackSQL: _needs_sanitization
         @test  _needs_sanitization(Vector{Float64})
         @test  _needs_sanitization(Symbol)
         @test  _needs_sanitization(Missing)
@@ -521,4 +521,4 @@ global_logger(ConsoleLogger(stderr, Logging.Warn))
         @test !_needs_sanitization(Union{String, Missing})
     end
 
-end  # @testset "QueryDF.jl"
+end  # @testset "QuackSQL.jl"

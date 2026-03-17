@@ -102,13 +102,13 @@ function _register_source!(conn::DuckDB.DB, name::String, source)
     if source isa DataFrame
         _register_dataframe!(conn, name, source)
     elseif source isa String
-        ext = lowercase(last(splitext(source)))
-        if any(source -> endswith(lowercase(source), e) for e in CSV_EXTS)
+        lower_source = lowercase(source)
+        if any(e -> endswith(lower_source, e), CSV_EXTS)
             _register_csv_view!(conn, name, source)
-        elseif any(source -> endswith(lowercase(source), e) for e in PARQUET_EXTS) ||
+        elseif any(e -> endswith(lower_source, e), PARQUET_EXTS) ||
                occursin('*', source) || occursin('?', source)   # glob → parquet assumed
             _register_parquet_view!(conn, name, source)
-        elseif any(source -> endswith(lowercase(source), e) for e in DUCKDB_EXTS)
+        elseif any(e -> endswith(lower_source, e), DUCKDB_EXTS)
             _attach_database!(conn, name, source)
         else
             # Best-effort: try attaching as a database catalog

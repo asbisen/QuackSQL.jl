@@ -125,12 +125,76 @@ end
 
 function _register_dataframe!(conn::DuckDB.DB, name::String, df::DataFrame)
     if isdefined(DuckDB, :register_data_frame)
-        DuckDB.register_data_frame(conn, df, name)
-        @debug "DataFrame registered (native)" name=name rows=nrow(df)
+        # Sanitize before native registration: DuckDB cannot handle Vector{T},
+        # Symbol, pure-Missing columns, or other non-primitive Julia types.
+        sanitized = _sanitize_for_duckdb(df)
+        try
+            DuckDB.register_data_frame(conn, sanitized, name)
+            @debug "DataFrame registered (native)" name=name rows=nrow(df)
+            return
+        catch e
+            @debug "Native DataFrame registration failed, using fallback" exception=e
+        end
+        _register_dataframe_fallback!(conn, name, sanitized)
     else
-        # Fallback: materialise into a temp table using native DataFrame registration
         _register_dataframe_fallback!(conn, name, df)
     end
+end
+
+"""
+    _needs_sanitization(T) → Bool
+
+Return `true` when Julia type `T` cannot be mapped to a native DuckDB column
+type and the column's values must be serialized to VARCHAR before registration.
+
+DuckDB natively handles: `Bool`, `Integer` subtypes (signed & unsigned),
+`AbstractFloat`, `AbstractString`, `Date`, `DateTime`, and `Union{T, Missing}`
+where the inner type is itself supported.
+"""
+function _needs_sanitization(T::Type)::Bool
+    # Unwrap Union{T, Missing}  (e.g. Union{Vector{Float64}, Missing})
+    if T isa Union
+        inner = filter(!=(Missing), Base.uniontypes(T))
+        isempty(inner) && return true   # Union{} / all-missing → treat as NULL VARCHAR
+        length(inner) == 1 && return _needs_sanitization(inner[1])
+        return true  # multi-type union without a single non-Missing type
+    end
+    T === Missing        && return true   # column is entirely missing
+    T <: Bool            && return false
+    T <: Integer         && return false  # Int8/16/32/64, UInt8/16/32/64, …
+    T <: AbstractFloat   && return false
+    T <: AbstractString  && return false
+    T <: Dates.Date      && return false
+    T <: Dates.DateTime  && return false
+    return true  # Symbol, Vector{T}, custom structs, etc.
+end
+
+"""
+    _sanitize_for_duckdb(df) → DataFrame
+
+Return a version of `df` where columns with DuckDB-incompatible element types
+(arrays, `Symbol`, pure `Missing`, unknown structs, …) have been cast to
+`Union{String, Missing}` via `string`.  Columns that are already compatible
+are shared by reference — no unnecessary data copying occurs.
+"""
+function _sanitize_for_duckdb(df::DataFrame)::DataFrame
+    needs_work = any(_needs_sanitization(eltype(df[!, c])) for c in names(df))
+    !needs_work && return df   # fast path: nothing to do
+
+    result = DataFrame()
+    for col in names(df)
+        T = eltype(df[!, col])
+        if _needs_sanitization(T)
+            converted = Union{String, Missing}[
+                v === missing ? missing : string(v) for v in df[!, col]
+            ]
+            result[!, col] = converted
+            @debug "Column serialized to VARCHAR for DuckDB" column=col from=T
+        else
+            result[!, col] = df[!, col]
+        end
+    end
+    return result
 end
 
 function _register_dataframe_fallback!(conn::DuckDB.DB, name::String, df::DataFrame)
@@ -189,6 +253,7 @@ function julia_type_to_duckdb(T::Type)::String
         length(inner) == 1 && return julia_type_to_duckdb(inner[1])
         return "VARCHAR"
     end
+    T === Missing       && return "VARCHAR"
     T <: Bool          && return "BOOLEAN"
     T <: Integer       && return "BIGINT"
     T <: AbstractFloat && return "DOUBLE"

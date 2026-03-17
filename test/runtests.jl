@@ -317,4 +317,59 @@ global_logger(ConsoleLogger(stderr, Logging.Warn))
         close!(ctx)
     end
 
+    # ── DuckDB-incompatible column types (Vector, Symbol, Missing) ─────────────
+    @testset "DataFrame with incompatible column types" begin
+        ctx = QueryContext()
+        # Replicate the real-world case from the bug report:
+        # Vector{Float64}, Symbol, and all-Missing columns
+        df_src = DataFrame(
+            id              = Int32[1, 2, 3],
+            power_phase     = Union{Vector{Float64}, Missing}[
+                                  [326.25, 260.156],
+                                  [329.063, 258.75],
+                                  missing],
+            cadence         = UInt8[41, 35, 37],
+            message_name    = Symbol[:record, :record, :record],
+            left_smoothness = Missing[missing, missing, missing]
+        )
+
+        # Registration must not throw
+        @test_nowarn register!(ctx, "sensor", df_src)
+
+        df = execute(ctx, "SELECT id, cadence FROM sensor ORDER BY id")
+        @test nrow(df) == 3
+        @test df[1, :id] == 1
+        @test df[2, :cadence] == 35
+
+        # Vector columns serialized to string
+        df2 = execute(ctx, "SELECT power_phase FROM sensor WHERE id = 1")
+        @test df2[1, :power_phase] == "[326.25, 260.156]"
+
+        # Symbol column serialized to string
+        df3 = execute(ctx, "SELECT message_name FROM sensor WHERE id = 2")
+        @test df3[1, :message_name] == "record"
+
+        # Pure-missing column registered without error; values are NULL
+        df4 = execute(ctx, "SELECT left_smoothness FROM sensor")
+        @test all(ismissing, df4[!, :left_smoothness])
+
+        close!(ctx)
+    end
+
+    # ── _needs_sanitization helper ────────────────────────────────────────────
+    @testset "_needs_sanitization" begin
+        using QueryDF: _needs_sanitization
+        @test  _needs_sanitization(Vector{Float64})
+        @test  _needs_sanitization(Symbol)
+        @test  _needs_sanitization(Missing)
+        @test  _needs_sanitization(Union{Vector{Float64}, Missing})
+        @test !_needs_sanitization(Int32)
+        @test !_needs_sanitization(UInt8)
+        @test !_needs_sanitization(Float64)
+        @test !_needs_sanitization(String)
+        @test !_needs_sanitization(Bool)
+        @test !_needs_sanitization(Union{Int64, Missing})
+        @test !_needs_sanitization(Union{String, Missing})
+    end
+
 end  # @testset "QueryDF.jl"

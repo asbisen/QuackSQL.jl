@@ -1,0 +1,45 @@
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+
+# Julia compiled files
+*.ji
+
+# Julia package directory
+/.julia/
+
+Manifest.toml
+
+# Julia project manifest and environment backups
+Manifest.toml.bak
+Project.toml.bak
+
+# VS Code settings
+.vscode/
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+/build/
+deps/
+docs/build/
+
+# Generated Global Fit Profile JSON files
+contrib/fit_data_export/ 
+
+# Fit SDK Python code
+contrib/fit-python-sdk/ 
+
+# Sample Code Notebooks
+notebooks/

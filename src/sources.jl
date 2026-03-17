@@ -12,6 +12,25 @@ const CSV_EXTS     = (".csv", ".tsv", ".csv.gz")
 const DUCKDB_EXTS  = (".duckdb", ".db")
 
 """
+    ParquetSource(path; union_by_name=false)
+
+Internal wrapper that pairs a Parquet path (or glob) with read options.  Created
+automatically by `register!` when keyword options are supplied.
+"""
+struct ParquetSource
+    path::String
+    union_by_name::Bool
+end
+
+ParquetSource(path::String; union_by_name::Bool=false) =
+    ParquetSource(path, union_by_name)
+
+"""Return true when `s` looks like a parquet source (extension or glob)."""
+_looks_like_parquet(s::String) =
+    any(e -> endswith(lowercase(s), e), PARQUET_EXTS) ||
+    occursin('*', s) || occursin('?', s)
+
+"""
     register!(ctx, name, source)
     register!(ctx, name => source, ...)
 
@@ -28,12 +47,22 @@ lazily (on first connection use) for pooled contexts.
 | Parquet path or glob     | `name`                | `CREATE VIEW … AS read_parquet`   |
 | DuckDB/SQLite file       | `name` (catalog)      | `ATTACH`                          |
 
+# Keyword options (Parquet only)
+
+- `union_by_name=false` — pass `union_by_name=true` to `read_parquet` so that
+  multiple files whose schemas differ are merged by column name rather than by
+  position.  Mirrors the DuckDB `read_parquet(…, union_by_name=true)` option.
+  Using this with a non-Parquet source throws an `ArgumentError`.
+
 # Examples
 ```julia
 register!(ctx, "customers", df_customers)
 register!(ctx, "trips",     "yellow_tripdata_2024.parquet")
 register!(ctx, "events",    "events/*.csv")
 register!(ctx, "archive",   "archive.duckdb")
+
+# Glob over heterogeneous parquet files — merge columns by name
+register!(ctx, "logs", "logs/*.parquet"; union_by_name=true)
 
 # Bulk registration using pairs
 register!(ctx,
@@ -42,13 +71,21 @@ register!(ctx,
 )
 ```
 """
-function register!(ctx::QueryContext, name::String, source)
-    ctx.sources[name] = source
+function register!(ctx::QueryContext, name::String, source; union_by_name::Bool=false)
+    actual_source = if union_by_name && source isa String
+        _looks_like_parquet(source) || throw(ArgumentError(
+            "union_by_name is only supported for Parquet/glob sources, got: $source"
+        ))
+        ParquetSource(source, true)
+    else
+        source
+    end
+    ctx.sources[name] = actual_source
     # Eagerly apply to the live single connection (if any)
     if ctx._conn !== nothing
-        _register_source!(ctx._conn, name, source)
+        _register_source!(ctx._conn, name, actual_source)
     end
-    @info "Source registered" name=name type=typeof(source)
+    @info "Source registered" name=name type=typeof(actual_source)
 end
 
 # Variadic pair form
@@ -99,7 +136,9 @@ end
 Apply a single source to an open DuckDB connection.
 """
 function _register_source!(conn::DuckDB.DB, name::String, source)
-    if source isa DataFrame
+    if source isa ParquetSource
+        _register_parquet_view!(conn, name, source.path; union_by_name=source.union_by_name)
+    elseif source isa DataFrame
         _register_dataframe!(conn, name, source)
     elseif source isa String
         lower_source = lowercase(source)
@@ -220,9 +259,11 @@ function _register_csv_view!(conn::DuckDB.DB, name::String, path::String)
     @debug "CSV view registered" name=name path=path
 end
 
-function _register_parquet_view!(conn::DuckDB.DB, name::String, path::String)
-    DuckDB.execute(conn, "CREATE OR REPLACE VIEW \"$(escape_identifier(name))\" AS SELECT * FROM read_parquet('$(escape_sql_string(path))')")
-    @debug "Parquet view registered" name=name path=path
+function _register_parquet_view!(conn::DuckDB.DB, name::String, path::String;
+                                  union_by_name::Bool=false)
+    opts = union_by_name ? ", union_by_name=true" : ""
+    DuckDB.execute(conn, "CREATE OR REPLACE VIEW \"$(escape_identifier(name))\" AS SELECT * FROM read_parquet('$(escape_sql_string(path))'$opts)")
+    @debug "Parquet view registered" name=name path=path union_by_name=union_by_name
 end
 
 function _attach_database!(conn::DuckDB.DB, name::String, path::String)
@@ -235,6 +276,8 @@ function _deregister_source!(conn::DuckDB.DB, name::String, source)
     if source isa DataFrame
         try DuckDB.execute(conn, "DROP VIEW IF EXISTS $qname") catch end
         try DuckDB.execute(conn, "DROP TABLE IF EXISTS $qname") catch end
+    elseif source isa ParquetSource
+        try DuckDB.execute(conn, "DROP VIEW IF EXISTS $qname") catch end
     elseif source isa String && any(endswith(lowercase(source), e) for e in DUCKDB_EXTS)
         try DuckDB.execute(conn, "DETACH $qname") catch end
     else
@@ -281,7 +324,8 @@ escape_identifier(s::String) = replace(s, "\"" => "\"\"")
 escape_sql_string(s::String) = replace(s, "'" => "''")
 
 function _source_type_label(src)::String
-    src isa DataFrame && return "DataFrame"
+    src isa DataFrame    && return "DataFrame"
+    src isa ParquetSource && return "Parquet"
     src isa String    && any(endswith(lowercase(src), e) for e in DUCKDB_EXTS) && return "DuckDB"
     src isa String    && any(endswith(lowercase(src), e) for e in PARQUET_EXTS) && return "Parquet"
     src isa String    && any(endswith(lowercase(src), e) for e in CSV_EXTS) && return "CSV"
@@ -290,7 +334,8 @@ function _source_type_label(src)::String
 end
 
 function _source_info(src)::String
-    src isa DataFrame && return "$(nrow(src)) rows × $(ncol(src)) cols"
+    src isa DataFrame    && return "$(nrow(src)) rows × $(ncol(src)) cols"
+    src isa ParquetSource && return "$(src.path)" * (src.union_by_name ? " (union_by_name=true)" : "")
     src isa String    && return src
     return string(src)
 end

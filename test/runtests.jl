@@ -356,6 +356,155 @@ global_logger(ConsoleLogger(stderr, Logging.Warn))
         close!(ctx)
     end
 
+    # ── Parquet union_by_name ─────────────────────────────────────────────────
+
+    # ParquetSource struct tests need no files — they don't create a context.
+    @testset "ParquetSource struct" begin
+        using QueryDF: ParquetSource
+        src = ParquetSource("data/*.parquet", true)
+        @test src.path == "data/*.parquet"
+        @test src.union_by_name == true
+
+        src2 = ParquetSource("single.parquet"; union_by_name=false)
+        @test src2.union_by_name == false
+    end
+
+    # ArgumentError is raised before any DuckDB call, so no files needed.
+    @testset "register! union_by_name on non-parquet throws ArgumentError" begin
+        ctx = QueryContext()
+        @test_throws ArgumentError register!(ctx, "data", "data.csv"; union_by_name=true)
+        @test_throws ArgumentError register!(ctx, "db",   "mydb.duckdb"; union_by_name=true)
+        close!(ctx)
+    end
+
+    # All remaining tests need real parquet files because DuckDB validates
+    # glob patterns eagerly when CREATE OR REPLACE VIEW is executed.
+    @testset "union_by_name integration" begin
+        using QueryDF: ParquetSource
+
+        tmp_dir = mktempdir()
+        pq1  = joinpath(tmp_dir, "part1.parquet")
+        pq2  = joinpath(tmp_dir, "part2.parquet")
+        glob = joinpath(tmp_dir, "*.parquet")
+
+        # Write two identical-schema parquet files for the basic tests.
+        setup_conn = DuckDB.DB(":memory:")
+        DuckDB.execute(setup_conn, "COPY (SELECT 1 AS id, 'x' AS label) TO '$pq1'")
+        DuckDB.execute(setup_conn, "COPY (SELECT 2 AS id, 'y' AS label) TO '$pq2'")
+        DuckDB.close(setup_conn)
+
+        try
+            @testset "register! stores ParquetSource when union_by_name=true" begin
+                ctx = QueryContext()
+                register!(ctx, "logs", glob; union_by_name=true)
+
+                stored = ctx.sources["logs"]
+                @test stored isa ParquetSource
+                @test stored.path == glob
+                @test stored.union_by_name == true
+                close!(ctx)
+            end
+
+            @testset "register! without union_by_name stores plain String" begin
+                ctx = QueryContext()
+                register!(ctx, "events", glob)
+
+                @test ctx.sources["events"] isa String
+                @test !(ctx.sources["events"] isa ParquetSource)
+                close!(ctx)
+            end
+
+            @testset "list_sources reflects union_by_name in info" begin
+                ctx = QueryContext()
+                register!(ctx, "logs",   glob; union_by_name=true)
+                register!(ctx, "events", glob)
+
+                sources = list_sources(ctx)
+                logs_row   = sources[sources.name .== "logs",   :]
+                events_row = sources[sources.name .== "events", :]
+
+                @test logs_row[1, :type] == "Parquet"
+                @test occursin("union_by_name=true", logs_row[1, :info])
+                @test events_row[1, :type] == "Parquet"
+                @test !occursin("union_by_name", events_row[1, :info])
+                close!(ctx)
+            end
+
+            @testset "view SQL includes union_by_name=true" begin
+                ctx = QueryContext()
+                register!(ctx, "files", glob; union_by_name=true)
+
+                df = execute(ctx, """
+                    SELECT view_definition
+                    FROM information_schema.views
+                    WHERE table_name = 'files'
+                """)
+                @test nrow(df) == 1
+                # DuckDB normalizes the SQL (e.g. to `union_by_name = CAST('t' AS BOOLEAN)`),
+                # so we only assert that the parameter name appears in the stored definition.
+                @test occursin("union_by_name", df[1, :view_definition])
+                close!(ctx)
+            end
+
+            @testset "deregister! ParquetSource removes source" begin
+                ctx = QueryContext()
+                register!(ctx, "logs", glob; union_by_name=true)
+                @test haskey(ctx.sources, "logs")
+
+                deregister!(ctx, "logs")
+                @test !haskey(ctx.sources, "logs")
+                close!(ctx)
+            end
+
+            @testset "query parquet glob with matching schemas" begin
+                ctx = QueryContext()
+                register!(ctx, "all_parts", glob; union_by_name=true)
+                df = execute(ctx, "SELECT * FROM all_parts ORDER BY id")
+                @test nrow(df) == 2
+                @test df[1, :id] == 1
+                @test df[2, :label] == "y"
+                close!(ctx)
+            end
+
+        finally
+            rm(tmp_dir; recursive=true)
+        end
+    end
+
+    @testset "union_by_name=true merges mismatched schemas" begin
+        tmp_dir = mktempdir()
+        try
+            f1 = joinpath(tmp_dir, "a.parquet")
+            f2 = joinpath(tmp_dir, "b.parquet")
+            conn_tmp = DuckDB.DB(":memory:")
+            # f1 has columns: id, col_a
+            DuckDB.execute(conn_tmp, "COPY (SELECT 1 AS id, 10 AS col_a) TO '$f1'")
+            # f2 has columns: id, col_b  (different extra column)
+            DuckDB.execute(conn_tmp, "COPY (SELECT 2 AS id, 20 AS col_b) TO '$f2'")
+            DuckDB.close(conn_tmp)
+
+            ctx = QueryContext()
+            glob = joinpath(tmp_dir, "*.parquet")
+
+            # Without union_by_name DuckDB would raise a schema mismatch error.
+            # With union_by_name=true it merges by name and fills gaps with NULL.
+            register!(ctx, "parts", glob; union_by_name=true)
+            df = execute(ctx, "SELECT * FROM parts ORDER BY id")
+
+            @test nrow(df) == 2
+            @test "id"    in names(df)
+            @test "col_a" in names(df)
+            @test "col_b" in names(df)
+            @test df[1, :id] == 1
+            @test df[2, :id] == 2
+            @test ismissing(df[1, :col_b])   # row from f1 has no col_b
+            @test ismissing(df[2, :col_a])   # row from f2 has no col_a
+            close!(ctx)
+        finally
+            rm(tmp_dir; recursive=true)
+        end
+    end
+
     # ── _needs_sanitization helper ────────────────────────────────────────────
     @testset "_needs_sanitization" begin
         using QueryDF: _needs_sanitization

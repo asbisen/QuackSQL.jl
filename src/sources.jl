@@ -85,7 +85,7 @@ function register!(ctx::QueryContext, name::String, source; union_by_name::Bool=
     if ctx._conn !== nothing
         _register_source!(ctx._conn, name, actual_source)
     end
-    @info "Source registered" name=name type=typeof(actual_source)
+    @debug "Source registered" name=name type=typeof(actual_source)
 end
 
 # Variadic pair form

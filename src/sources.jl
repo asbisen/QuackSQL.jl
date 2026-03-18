@@ -72,6 +72,11 @@ register!(ctx,
 ```
 """
 function register!(ctx::QueryContext, name::String, source; union_by_name::Bool=false)
+    ctx._closed && throw(QueryError("QueryContext has been closed."))
+
+    had_previous = haskey(ctx.sources, name)
+    previous_source = had_previous ? ctx.sources[name] : nothing
+
     actual_source = if union_by_name && source isa String
         _looks_like_parquet(source) || throw(ArgumentError(
             "union_by_name is only supported for Parquet/glob sources, got: $source"
@@ -81,8 +86,69 @@ function register!(ctx::QueryContext, name::String, source; union_by_name::Bool=
         source
     end
     ctx.sources[name] = actual_source
+
+    if ctx._pool !== nothing
+        pool = ctx._pool
+
+        lock(pool._lock) do
+            pool.sources[name] = actual_source
+        end
+
+        available = DuckDB.DB[]
+        while isready(pool.channel)
+            push!(available, take!(pool.channel))
+        end
+
+        try
+            # Apply changes immediately to currently idle connections.
+            for conn in available
+                if had_previous
+                    try
+                        _deregister_source!(conn, name, previous_source)
+                    catch e
+                        @warn "Failed to deregister replaced pooled source" name=name exception=e
+                    end
+                    lock(pool._lock) do
+                        delete!(get!(pool._applied, conn, Set{String}()), name)
+                    end
+                end
+
+                _register_source!(conn, name, actual_source)
+                lock(pool._lock) do
+                    push!(get!(pool._applied, conn, Set{String}()), name)
+                end
+            end
+
+            # For checked-out connections, queue replacement cleanup and force
+            # source re-application when they are next released/acquired.
+            lock(pool._lock) do
+                for conn in keys(pool._in_use)
+                    if had_previous
+                        pending = get!(pool._pending_drops, conn, Dict{String, Any}())
+                        pending[name] = previous_source
+                    end
+                    delete!(get!(pool._applied, conn, Set{String}()), name)
+                end
+            end
+        finally
+            for conn in available
+                put!(pool.channel, conn)
+            end
+        end
+
+        @debug "Source registered (pooled context)" name=name type=typeof(actual_source)
+        return
+    end
+
     # Eagerly apply to the live single connection (if any)
     if ctx._conn !== nothing
+        if had_previous
+            try
+                _deregister_source!(ctx._conn, name, previous_source)
+            catch e
+                @warn "Failed to deregister replaced source" name=name exception=e
+            end
+        end
         _register_source!(ctx._conn, name, actual_source)
     end
     @debug "Source registered" name=name type=typeof(actual_source)
@@ -102,11 +168,53 @@ Remove a previously registered source.  For DataFrames and views this drops the
 VIEW; for attached databases this issues DETACH.
 """
 function deregister!(ctx::QueryContext, name::String)
+    ctx._closed && throw(QueryError("QueryContext has been closed."))
+
     if !haskey(ctx.sources, name)
         @warn "Attempted to deregister unknown source" name=name
         return
     end
     src = pop!(ctx.sources, name)
+
+    if ctx._pool !== nothing
+        pool = ctx._pool
+
+        lock(pool._lock) do
+            haskey(pool.sources, name) && delete!(pool.sources, name)
+        end
+
+        available = DuckDB.DB[]
+        while isready(pool.channel)
+            push!(available, take!(pool.channel))
+        end
+
+        try
+            # Apply deregistration immediately to idle pooled connections.
+            for conn in available
+                _deregister_source!(conn, name, src)
+                lock(pool._lock) do
+                    delete!(get!(pool._applied, conn, Set{String}()), name)
+                end
+            end
+
+            # Queue deregistration for currently checked-out connections.
+            lock(pool._lock) do
+                for conn in keys(pool._in_use)
+                    pending = get!(pool._pending_drops, conn, Dict{String, Any}())
+                    pending[name] = src
+                    delete!(get!(pool._applied, conn, Set{String}()), name)
+                end
+            end
+        finally
+            for conn in available
+                put!(pool.channel, conn)
+            end
+        end
+
+        @debug "Source deregistered (pooled context)" name=name
+        return
+    end
+
     if ctx._conn !== nothing
         _deregister_source!(ctx._conn, name, src)
     end

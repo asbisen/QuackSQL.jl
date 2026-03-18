@@ -126,10 +126,13 @@ function _with_conn(f::Function, ctx::QueryContext)
             # Sync pool's source registry with context's registry
             # (register! on ctx also adds to pool, but belt-and-suspenders)
             for (name, src) in ctx.sources
-                if !(name in get(ctx._pool._applied, conn, Set{String}()))
+                needs_apply = lock(ctx._pool._lock) do
+                    !(name in get(ctx._pool._applied, conn, Set{String}()))
+                end
+                if needs_apply
                     _register_source!(conn, name, src)
                     lock(ctx._pool._lock) do
-                        push!(ctx._pool._applied[conn], name)
+                        push!(get!(ctx._pool._applied, conn, Set{String}()), name)
                     end
                 end
             end

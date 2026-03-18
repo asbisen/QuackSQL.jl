@@ -269,6 +269,7 @@ function explain(ctx::QueryContext, sql::String; analyze::Bool=false)::String
     prefix = analyze ? "EXPLAIN ANALYZE " : "EXPLAIN "
     _with_conn(ctx) do conn
         df, _ = _run(conn, ctx.config, "$prefix$sql")
+        (ncol(df) == 0 || nrow(df) == 0) && return ""
         join(df[!, end], "\n")
     end
 end

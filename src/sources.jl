@@ -110,7 +110,7 @@ function deregister!(ctx::QueryContext, name::String)
     if ctx._conn !== nothing
         _deregister_source!(ctx._conn, name, src)
     end
-    @info "Source deregistered" name=name
+    @debug "Source deregistered" name=name
 end
 
 """

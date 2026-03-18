@@ -38,10 +38,13 @@ mutable struct ConnectionPool
     config::QueryConfig
     channel::Channel{DuckDB.DB}
     size::Int
+    _closed::Bool
 
     # Per-connection set of source names already registered on that connection.
     # Guarded by _lock so it is safe to read/write from multiple tasks.
     _applied::IdDict{DuckDB.DB, Set{String}}
+    _in_use::IdDict{DuckDB.DB, Bool}
+    _pending_drops::IdDict{DuckDB.DB, Dict{String, Any}}
     _lock::ReentrantLock
 
     # Shared source registry (name → raw source object).
@@ -58,8 +61,9 @@ mutable struct ConnectionPool
         _validate_config(config)
         ch = Channel{DuckDB.DB}(size)
         pool = new(
-            db_path, config, ch, size,
-            IdDict{DuckDB.DB, Set{String}}(), ReentrantLock(),
+            db_path, config, ch, size, false,
+            IdDict{DuckDB.DB, Set{String}}(), IdDict{DuckDB.DB, Bool}(),
+            IdDict{DuckDB.DB, Dict{String, Any}}(), ReentrantLock(),
             Dict{String, Any}()
         )
         # Pre-warm all connections
@@ -98,6 +102,26 @@ function _ensure_sources_applied!(pool::ConnectionPool, conn::DuckDB.DB)
     end
 end
 
+function _apply_pending_drops!(pool::ConnectionPool, conn::DuckDB.DB)
+    pending = lock(pool._lock) do
+        haskey(pool._pending_drops, conn) || return Pair{String, Any}[]
+        queued = collect(pool._pending_drops[conn])
+        delete!(pool._pending_drops, conn)
+        queued
+    end
+
+    for (name, src) in pending
+        try
+            _deregister_source!(conn, name, src)
+        catch e
+            @warn "Pool: failed pending source deregistration" name=name exception=e
+        end
+        lock(pool._lock) do
+            delete!(get!(pool._applied, conn, Set{String}()), name)
+        end
+    end
+end
+
 function _finalizer_close!(pool::ConnectionPool)
     try close!(pool) catch end   # never throw from a finalizer
 end
@@ -111,10 +135,34 @@ Borrow a connection from the pool, blocking until one is available.
 You **must** call `release!` when done, or preferably use `with_connection`.
 """
 function acquire!(pool::ConnectionPool)::DuckDB.DB
+    lock(pool._lock) do
+        pool._closed && throw(QueryError("ConnectionPool has been closed."))
+    end
+
     conn = take!(pool.channel)
-    _ensure_sources_applied!(pool, conn)
-    @debug "Pool: acquired connection" pool_size=pool.size
-    return conn
+    try
+        lock(pool._lock) do
+            if pool._closed
+                throw(QueryError("ConnectionPool has been closed."))
+            end
+            pool._in_use[conn] = true
+        end
+        _apply_pending_drops!(pool, conn)
+        _ensure_sources_applied!(pool, conn)
+        @debug "Pool: acquired connection" pool_size=pool.size
+        return conn
+    catch
+        should_close = lock(pool._lock) do
+            haskey(pool._in_use, conn) && delete!(pool._in_use, conn)
+            pool._closed
+        end
+        if should_close
+            try close(conn) catch end
+        else
+            put!(pool.channel, conn)
+        end
+        rethrow()
+    end
 end
 
 """
@@ -123,6 +171,21 @@ end
 Return a previously acquired connection to the pool.
 """
 function release!(pool::ConnectionPool, conn::DuckDB.DB)
+    was_in_use, is_closed = lock(pool._lock) do
+        in_use = haskey(pool._in_use, conn)
+        in_use && delete!(pool._in_use, conn)
+        in_use, pool._closed
+    end
+
+    if is_closed
+        try close(conn) catch end
+        @debug "Pool: released connection after close (closed instead of re-pooled)"
+        return
+    end
+
+    was_in_use || throw(QueryError("Attempted to release a connection that is not checked out from this pool."))
+    _apply_pending_drops!(pool, conn)
+    _ensure_sources_applied!(pool, conn)
     put!(pool.channel, conn)
     @debug "Pool: released connection"
 end
@@ -153,12 +216,22 @@ end
 Drain the pool channel and close every connection.
 """
 function close!(pool::ConnectionPool)
+    borrowed_count = lock(pool._lock) do
+        pool._closed && return 0
+        pool._closed = true
+        length(pool._in_use)
+    end
+
     # Drain and close all connections currently in the channel
     while isready(pool.channel)
         conn = take!(pool.channel)
         try close(conn) catch end
+        lock(pool._lock) do
+            delete!(pool._applied, conn)
+            delete!(pool._pending_drops, conn)
+        end
     end
-    @debug "Pool: closed all connections"
+    @debug "Pool: closed all available connections" borrowed=borrowed_count
 end
 
 """
@@ -170,6 +243,10 @@ The source will be lazily applied to each connection on first use.
 See `register!` on `QueryContext` for supported source types.
 """
 function register!(pool::ConnectionPool, name::String, source)
+    lock(pool._lock) do
+        pool._closed && throw(QueryError("ConnectionPool has been closed."))
+    end
+
     pool.sources[name] = source
     # Invalidate per-connection tracking so all existing connections
     # will re-apply the full source list on next acquisition.

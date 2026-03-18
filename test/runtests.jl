@@ -226,12 +226,30 @@ global_logger(ConsoleLogger(stderr, Logging.Warn))
         close!(ctx)
     end
 
+    @testset "on_error = :missing" begin
+        ctx = QueryContext(on_error=:missing)
+        df = execute(ctx, "SELECT * FROM nonexistent_table_xyz")
+        @test df isa DataFrame
+        @test names(df) == ["result"]
+        @test nrow(df) == 1
+        @test ismissing(df[1, :result])
+        close!(ctx)
+    end
+
     # ── explain ───────────────────────────────────────────────────────────────
     @testset "explain" begin
         ctx = QueryContext()
         plan = explain(ctx, "SELECT 1 + 1")
         @test plan isa String
         @test !isempty(plan)
+        close!(ctx)
+    end
+
+    @testset "explain with non-throw on_error" begin
+        ctx = QueryContext(on_error=:empty)
+        plan = explain(ctx, "SELECT * FROM nonexistent_table_xyz")
+        @test plan isa String
+        @test isempty(plan)
         close!(ctx)
     end
 
@@ -264,6 +282,116 @@ global_logger(ConsoleLogger(stderr, Logging.Warn))
         close!(pool)
     end
 
+    @testset "Pooled context source deregister/register propagation" begin
+        ctx = QueryContext(":memory:"; pool_size=2)
+        pool = ctx._pool
+
+        df_v1 = DataFrame(id=1:2, v=[10, 20])
+        register!(ctx, "t", df_v1)
+
+        # Hold all pooled connections so updates must be queued for in-use conns.
+        conn1 = acquire!(pool)
+        conn2 = acquire!(pool)
+
+        @test nrow(execute(conn1, ctx.config, "SELECT * FROM t")) == 2
+        @test nrow(execute(conn2, ctx.config, "SELECT * FROM t")) == 2
+
+        # Deregister while both conns are checked out.
+        deregister!(ctx, "t")
+        release!(pool, conn1)
+        release!(pool, conn2)
+
+        # Both pooled connections should observe the source removal.
+        conn1 = acquire!(pool)
+        conn2 = acquire!(pool)
+        @test_throws QueryError execute(conn1, ctx.config, "SELECT * FROM t")
+        @test_throws QueryError execute(conn2, ctx.config, "SELECT * FROM t")
+        release!(pool, conn1)
+        release!(pool, conn2)
+
+        # Replace source while both conns are checked out.
+        register!(ctx, "t", df_v1)
+        conn1 = acquire!(pool)
+        conn2 = acquire!(pool)
+        df_v2 = DataFrame(id=1:3, v=[100, 200, 300])
+        register!(ctx, "t", df_v2)
+        release!(pool, conn1)
+        release!(pool, conn2)
+
+        # Both connections should now see replacement data, not stale data.
+        conn1 = acquire!(pool)
+        conn2 = acquire!(pool)
+        @test execute(conn1, ctx.config, "SELECT SUM(v) AS s FROM t")[1, :s] == 600
+        @test execute(conn2, ctx.config, "SELECT COUNT(*) AS n FROM t")[1, :n] == 3
+        release!(pool, conn1)
+        release!(pool, conn2)
+
+        close!(ctx)
+    end
+
+    @testset "Pooled source sync concurrency stress" begin
+        ctx = QueryContext(":memory:"; pool_size=4)
+        register!(ctx, "t", DataFrame(id=1:2, v=[10, 20]))
+
+        err_lock = ReentrantLock()
+        errors = Any[]
+
+        readers = [Threads.@spawn begin
+            for _ in 1:40
+                try
+                    df = execute(ctx, "SELECT COUNT(*) AS n FROM t")
+                    if !(df[1, :n] in (2, 3))
+                        lock(err_lock) do
+                            push!(errors, ArgumentError("Unexpected row count $(df[1, :n]) in concurrency stress test"))
+                        end
+                    end
+                catch e
+                    lock(err_lock) do
+                        push!(errors, e)
+                    end
+                end
+                yield()
+            end
+        end for _ in 1:4]
+
+        writer = Threads.@spawn begin
+            for i in 1:60
+                if isodd(i)
+                    register!(ctx, "t", DataFrame(id=1:2, v=[10, 20]))
+                else
+                    register!(ctx, "t", DataFrame(id=1:3, v=[10, 20, 30]))
+                end
+                yield()
+            end
+        end
+
+        foreach(wait, readers)
+        wait(writer)
+
+        @test isempty(errors)
+        close!(ctx)
+    end
+
+    @testset "ConnectionPool close lifecycle" begin
+        pool = ConnectionPool(":memory:"; size=1)
+        conn = acquire!(pool)
+
+        # Closing with a borrowed connection should mark the pool closed,
+        # reject new acquisitions, and close borrowed handles on release.
+        close!(pool)
+        @test_throws QueryError acquire!(pool)
+        @test_throws QueryError with_connection(pool) do c
+            DuckDB.execute(c, "SELECT 1")
+        end
+
+        @test_nowarn release!(pool, conn)
+        @test !haskey(pool._in_use, conn)
+        @test !isready(pool.channel)   # closed pool does not re-pool released connections
+
+        # Idempotent close
+        @test_nowarn close!(pool)
+    end
+
     # ── File persistence ──────────────────────────────────────────────────────
     @testset "File-based database" begin
         db_file = tempname() * ".duckdb"
@@ -278,6 +406,24 @@ global_logger(ConsoleLogger(stderr, Logging.Warn))
             @test size(df) == (2, 2)
             @test df[2, :label] == "bar"
             close!(ctx2)
+        finally
+            isfile(db_file) && rm(db_file)
+        end
+    end
+
+    @testset "Readonly context blocks writes" begin
+        db_file = tempname() * ".duckdb"
+        try
+            ctx_rw = QueryContext(db_file)
+            execute!(ctx_rw, "CREATE TABLE ro_items (id INT)")
+            execute!(ctx_rw, "INSERT INTO ro_items VALUES (1)")
+            close!(ctx_rw)
+
+            ctx_ro = QueryContext(db_file; readonly=true)
+            df = execute(ctx_ro, "SELECT COUNT(*) AS n FROM ro_items")
+            @test df[1, :n] == 1
+            @test_throws QueryError execute!(ctx_ro, "INSERT INTO ro_items VALUES (2)")
+            close!(ctx_ro)
         finally
             isfile(db_file) && rm(db_file)
         end
@@ -519,6 +665,30 @@ global_logger(ConsoleLogger(stderr, Logging.Warn))
         @test !_needs_sanitization(Bool)
         @test !_needs_sanitization(Union{Int64, Missing})
         @test !_needs_sanitization(Union{String, Missing})
+    end
+
+    @testset "Named parameter parser edge cases" begin
+        ctx = QueryContext()
+
+        # Placeholder-like token inside a string literal must not be bound.
+        df_lit = execute(ctx, "SELECT ':not_a_param' AS txt, :x AS x", x=7)
+        @test df_lit[1, :txt] == ":not_a_param"
+        @test df_lit[1, :x] == 7
+
+        # Cast operator should not be parsed as a named parameter.
+        df_cast = execute(ctx, "SELECT 1::INT AS one, :y AS y", y=9)
+        @test df_cast[1, :one] == 1
+        @test df_cast[1, :y] == 9
+
+        # Comment text containing :tokens must not be bound.
+        df_comment = execute(ctx, """
+            -- :ignored_line_comment
+            /* :ignored_block_comment */
+            SELECT :z AS z
+        """, z=11)
+        @test df_comment[1, :z] == 11
+
+        close!(ctx)
     end
 
 end  # @testset "QuackSQL.jl"

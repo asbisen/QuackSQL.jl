@@ -96,7 +96,7 @@ export ConnectionPool, acquire!, release!, with_connection, close!
 export QueryContext, with_context, close!
 
 # Source management
-export register!, deregister!, list_sources
+export register!, deregister!, list_sources, ParquetSource, CsvSource
 
 # Query execution
 export execute, execute!, query, transaction, stream, explain

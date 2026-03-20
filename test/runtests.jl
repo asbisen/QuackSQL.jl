@@ -651,6 +651,139 @@ global_logger(ConsoleLogger(stderr, Logging.Warn))
         end
     end
 
+    # ── Phase 1 typed file sources ───────────────────────────────────────────
+    @testset "ParquetSource extended options" begin
+        using QuackSQL: ParquetSource
+
+        src = ParquetSource(
+            "data/*.parquet";
+            union_by_name=true,
+            filename=true,
+            hive_partitioning=true,
+            compression=:zstd,
+        )
+        @test src.path == "data/*.parquet"
+        @test src.union_by_name == true
+        @test src.filename == true
+        @test src.hive_partitioning == true
+        @test src.compression == :zstd
+
+        @test_throws ArgumentError ParquetSource("x.parquet"; compression=:not_a_codec)
+    end
+
+    @testset "ParquetSource compression rejected on register!" begin
+        tmp_dir = mktempdir()
+        try
+            pq = joinpath(tmp_dir, "data.parquet")
+            conn_tmp = DuckDB.DB(":memory:")
+            DuckDB.execute(conn_tmp, "COPY (SELECT 1 AS id) TO '$pq'")
+            DuckDB.close(conn_tmp)
+
+            ctx = QueryContext()
+            src = ParquetSource(pq; compression=:zstd)
+            @test_throws ArgumentError register!(ctx, "bad_parquet", src)
+            close!(ctx)
+        finally
+            rm(tmp_dir; recursive=true)
+        end
+    end
+
+    @testset "ParquetSource filename/hive_partitioning options" begin
+        using QuackSQL: ParquetSource
+
+        tmp_dir = mktempdir()
+        try
+            part_dir = joinpath(tmp_dir, "country=US")
+            mkpath(part_dir)
+            pq = joinpath(part_dir, "part.parquet")
+
+            conn_tmp = DuckDB.DB(":memory:")
+            DuckDB.execute(conn_tmp, "COPY (SELECT 10 AS id) TO '$pq'")
+            DuckDB.close(conn_tmp)
+
+            ctx = QueryContext()
+            src = ParquetSource(joinpath(tmp_dir, "**", "*.parquet"); filename=true, hive_partitioning=true)
+            register!(ctx, "pq_ext", src)
+
+            df = execute(ctx, "SELECT * FROM pq_ext")
+            @test nrow(df) == 1
+            @test "filename" in names(df)
+            @test "country" in names(df)
+
+            meta = execute(ctx, """
+                SELECT view_definition
+                FROM information_schema.views
+                WHERE table_name = 'pq_ext'
+            """)
+            @test nrow(meta) == 1
+            @test occursin("filename", meta[1, :view_definition])
+            @test occursin("hive_partitioning", meta[1, :view_definition])
+            close!(ctx)
+        finally
+            rm(tmp_dir; recursive=true)
+        end
+    end
+
+    @testset "CsvSource basic options" begin
+        using QuackSQL: CsvSource
+
+        tmp_dir = mktempdir()
+        try
+            csv_file = joinpath(tmp_dir, "people.csv")
+            open(csv_file, "w") do io
+                write(io, "id|name|score\n")
+                write(io, "1|alice|10\n")
+                write(io, "2|bob|20\n")
+            end
+
+            ctx = QueryContext()
+            src = CsvSource(csv_file; delim='|', header=true)
+            register!(ctx, "people", src)
+
+            df = execute(ctx, "SELECT * FROM people ORDER BY id")
+            @test nrow(df) == 2
+            @test df[1, :name] == "alice"
+            @test df[2, :score] == 20
+
+            sources = list_sources(ctx)
+            row = sources[sources.name .== "people", :]
+            @test nrow(row) == 1
+            @test row[1, :type] == "CSV"
+            @test occursin("delim=|", row[1, :info])
+            close!(ctx)
+        finally
+            rm(tmp_dir; recursive=true)
+        end
+    end
+
+    @testset "CsvSource nullstr and sample_size validation" begin
+        using QuackSQL: CsvSource
+
+        @test_throws ArgumentError CsvSource("x.csv"; sample_size=0)
+
+        tmp_dir = mktempdir()
+        try
+            csv_file = joinpath(tmp_dir, "metrics.csv")
+            open(csv_file, "w") do io
+                write(io, "id,val\n")
+                write(io, "1,NA\n")
+                write(io, "2,7\n")
+            end
+
+            ctx = QueryContext()
+            src = CsvSource(csv_file; header=true, nullstr="NA")
+            register!(ctx, "metrics", src)
+
+            df = execute(ctx, "SELECT * FROM metrics ORDER BY id")
+            @test nrow(df) == 2
+            @test ismissing(df[1, :val])
+            @test df[2, :val] == 7
+            close!(ctx)
+        finally
+            rm(tmp_dir; recursive=true)
+        end
+    end
+
     # ── _needs_sanitization helper ────────────────────────────────────────────
     @testset "_needs_sanitization" begin
         using QuackSQL: _needs_sanitization

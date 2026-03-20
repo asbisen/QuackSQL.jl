@@ -91,6 +91,9 @@ end
 
 ### Registering data sources
 
+For most use cases, prefer plain string paths.  This keeps registration simple
+and readable, and is the recommended default.
+
 ```julia
 # Single registration
 register!(ctx, "customers", df_customers)          # DataFrame
@@ -109,6 +112,55 @@ register!(ctx,
 list_sources(ctx)             # DataFrame with name / type / info columns
 deregister!(ctx, "events")
 ```
+
+When you need format-specific read options, use typed source wrappers.
+
+```julia
+using QuackSQL: ParquetSource, CsvSource
+
+# Parquet with read options
+register!(ctx, "logs", ParquetSource(
+    "logs/*.parquet";
+    union_by_name=true,
+    filename=true,
+    hive_partitioning=true,
+))
+
+# CSV with read options
+register!(ctx, "events_csv", CsvSource(
+    "events/*.csv";
+    header=true,
+    delim='|',
+    nullstr="NA",
+    sample_size=20_000,
+))
+```
+
+#### Typed source options
+
+`ParquetSource(path; ...)`
+
+- `union_by_name::Bool=false`
+- `filename::Bool=false`
+- `hive_partitioning::Union{Bool,Nothing}=nothing`
+- `compression::Union{Symbol,Nothing}=nothing`
+
+`compression` is accepted for forward compatibility with future write/export
+APIs. It is currently **not** a `read_parquet` option, so setting it during
+`register!` raises an `ArgumentError`.
+
+`CsvSource(path; ...)`
+
+- `header::Union{Bool,Nothing}=nothing`
+- `delim::Union{Char,Nothing}=nothing`
+- `quotechar::Union{Char,Nothing}=nothing`
+- `escape::Union{Char,Nothing}=nothing`
+- `nullstr::Union{String,Nothing}=nothing`
+- `auto_detect::Bool=true`
+- `sample_size::Union{Int,Nothing}=nothing`
+
+If you do not need these options, continue to use string paths as the preferred
+interface.
 
 ---
 

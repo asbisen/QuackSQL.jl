@@ -11,19 +11,82 @@ const PARQUET_EXTS = (".parquet", ".pq")
 const CSV_EXTS     = (".csv", ".tsv", ".csv.gz")
 const DUCKDB_EXTS  = (".duckdb", ".db")
 
-"""
-    ParquetSource(path; union_by_name=false)
+abstract type AbstractPathSource end
 
-Internal wrapper that pairs a Parquet path (or glob) with read options.  Created
-automatically by `register!` when keyword options are supplied.
 """
-struct ParquetSource
+    ParquetSource(path; union_by_name=false, filename=false,
+                  hive_partitioning=nothing, compression=nothing)
+
+Wrapper for a Parquet path (or glob) plus `read_parquet` options.
+
+`compression` is accepted for forward compatibility with write/export APIs,
+but is not supported by `read_parquet` and therefore causes `register!` to
+throw an `ArgumentError` when set.
+"""
+struct ParquetSource <: AbstractPathSource
     path::String
     union_by_name::Bool
+    filename::Bool
+    hive_partitioning::Union{Bool, Nothing}
+    compression::Union{Symbol, Nothing}
 end
 
-ParquetSource(path::String; union_by_name::Bool=false) =
-    ParquetSource(path, union_by_name)
+const PARQUET_COMPRESSION_CODECS = Set([
+    :snappy, :zstd, :gzip, :brotli, :lz4, :uncompressed
+])
+
+function ParquetSource(
+    path::String;
+    union_by_name::Bool=false,
+    filename::Bool=false,
+    hive_partitioning::Union{Bool, Nothing}=nothing,
+    compression::Union{Symbol, Nothing}=nothing
+)
+    if compression !== nothing && !(compression in PARQUET_COMPRESSION_CODECS)
+        throw(ArgumentError(
+            "Invalid compression codec: $compression. " *
+            "Expected one of: $(collect(PARQUET_COMPRESSION_CODECS))"
+        ))
+    end
+    return ParquetSource(path, union_by_name, filename, hive_partitioning, compression)
+end
+
+# Backward-compatible positional constructor used by existing tests/users.
+ParquetSource(path::String, union_by_name::Bool) =
+    ParquetSource(path; union_by_name=union_by_name)
+
+"""
+    CsvSource(path; header=nothing, delim=nothing, quotechar=nothing, escape=nothing,
+              nullstr=nothing, auto_detect=true, sample_size=nothing)
+
+Wrapper for a CSV/TSV path (or glob) plus `read_csv_auto` options.
+"""
+struct CsvSource <: AbstractPathSource
+    path::String
+    header::Union{Bool, Nothing}
+    delim::Union{Char, Nothing}
+    quotechar::Union{Char, Nothing}
+    escape::Union{Char, Nothing}
+    nullstr::Union{String, Nothing}
+    auto_detect::Bool
+    sample_size::Union{Int, Nothing}
+end
+
+function CsvSource(
+    path::String;
+    header::Union{Bool, Nothing}=nothing,
+    delim::Union{Char, Nothing}=nothing,
+    quotechar::Union{Char, Nothing}=nothing,
+    escape::Union{Char, Nothing}=nothing,
+    nullstr::Union{String, Nothing}=nothing,
+    auto_detect::Bool=true,
+    sample_size::Union{Int, Nothing}=nothing
+)
+    if sample_size !== nothing && sample_size <= 0
+        throw(ArgumentError("sample_size must be positive when provided, got: $sample_size"))
+    end
+    return CsvSource(path, header, delim, quotechar, escape, nullstr, auto_detect, sample_size)
+end
 
 """Return true when `s` looks like a parquet source (extension or glob)."""
 _looks_like_parquet(s::String) =
@@ -245,7 +308,20 @@ Apply a single source to an open DuckDB connection.
 """
 function _register_source!(conn::DuckDB.DB, name::String, source)
     if source isa ParquetSource
-        _register_parquet_view!(conn, name, source.path; union_by_name=source.union_by_name)
+        source.compression === nothing || throw(ArgumentError(
+            "Parquet compression is a write-time option and is not supported by read_parquet/register!. " *
+            "Got compression=$(source.compression)."
+        ))
+        _register_parquet_view!(
+            conn,
+            name,
+            source.path;
+            union_by_name=source.union_by_name,
+            filename=source.filename,
+            hive_partitioning=source.hive_partitioning,
+        )
+    elseif source isa CsvSource
+        _register_csv_view!(conn, name, source)
     elseif source isa DataFrame
         _register_dataframe!(conn, name, source)
     elseif source isa String
@@ -367,11 +443,37 @@ function _register_csv_view!(conn::DuckDB.DB, name::String, path::String)
     @debug "CSV view registered" name=name path=path
 end
 
+function _register_csv_view!(conn::DuckDB.DB, name::String, src::CsvSource)
+    opts = String[]
+    src.header !== nothing      && push!(opts, "header=$(src.header)")
+    src.delim !== nothing       && push!(opts, "delim='$(escape_sql_string(string(src.delim)))'")
+    src.quotechar !== nothing   && push!(opts, "quote='$(escape_sql_string(string(src.quotechar)))'")
+    src.escape !== nothing      && push!(opts, "escape='$(escape_sql_string(string(src.escape)))'")
+    src.nullstr !== nothing     && push!(opts, "nullstr='$(escape_sql_string(src.nullstr))'")
+    src.auto_detect != true     && push!(opts, "auto_detect=$(src.auto_detect)")
+    src.sample_size !== nothing && push!(opts, "sample_size=$(src.sample_size)")
+
+    sql_opts = isempty(opts) ? "" : ", " * join(opts, ", ")
+    DuckDB.execute(
+        conn,
+        "CREATE OR REPLACE VIEW \"$(escape_identifier(name))\" AS " *
+        "SELECT * FROM read_csv_auto('$(escape_sql_string(src.path))'$sql_opts)"
+    )
+    @debug "CSV source registered" name=name path=src.path options=opts
+end
+
 function _register_parquet_view!(conn::DuckDB.DB, name::String, path::String;
-                                  union_by_name::Bool=false)
-    opts = union_by_name ? ", union_by_name=true" : ""
-    DuckDB.execute(conn, "CREATE OR REPLACE VIEW \"$(escape_identifier(name))\" AS SELECT * FROM read_parquet('$(escape_sql_string(path))'$opts)")
-    @debug "Parquet view registered" name=name path=path union_by_name=union_by_name
+                                  union_by_name::Bool=false,
+                                  filename::Bool=false,
+                                  hive_partitioning::Union{Bool, Nothing}=nothing)
+    opts = String[]
+    union_by_name && push!(opts, "union_by_name=true")
+    filename && push!(opts, "filename=true")
+    hive_partitioning !== nothing && push!(opts, "hive_partitioning=$(hive_partitioning)")
+
+    sql_opts = isempty(opts) ? "" : ", " * join(opts, ", ")
+    DuckDB.execute(conn, "CREATE OR REPLACE VIEW \"$(escape_identifier(name))\" AS SELECT * FROM read_parquet('$(escape_sql_string(path))'$sql_opts)")
+    @debug "Parquet view registered" name=name path=path union_by_name=union_by_name filename=filename hive_partitioning=hive_partitioning
 end
 
 function _attach_database!(conn::DuckDB.DB, name::String, path::String)
@@ -434,6 +536,7 @@ escape_sql_string(s::String) = replace(s, "'" => "''")
 function _source_type_label(src)::String
     src isa DataFrame    && return "DataFrame"
     src isa ParquetSource && return "Parquet"
+    src isa CsvSource && return "CSV"
     src isa String    && any(endswith(lowercase(src), e) for e in DUCKDB_EXTS) && return "DuckDB"
     src isa String    && any(endswith(lowercase(src), e) for e in PARQUET_EXTS) && return "Parquet"
     src isa String    && any(endswith(lowercase(src), e) for e in CSV_EXTS) && return "CSV"
@@ -443,7 +546,25 @@ end
 
 function _source_info(src)::String
     src isa DataFrame    && return "$(nrow(src)) rows × $(ncol(src)) cols"
-    src isa ParquetSource && return "$(src.path)" * (src.union_by_name ? " (union_by_name=true)" : "")
+    if src isa ParquetSource
+        opts = String[]
+        src.union_by_name && push!(opts, "union_by_name=true")
+        src.filename && push!(opts, "filename=true")
+        src.hive_partitioning !== nothing && push!(opts, "hive_partitioning=$(src.hive_partitioning)")
+        src.compression !== nothing && push!(opts, "compression=$(src.compression)")
+        return isempty(opts) ? src.path : "$(src.path) (" * join(opts, ", ") * ")"
+    end
+    if src isa CsvSource
+        opts = String[]
+        src.header !== nothing && push!(opts, "header=$(src.header)")
+        src.delim !== nothing && push!(opts, "delim=$(src.delim)")
+        src.quotechar !== nothing && push!(opts, "quote=$(src.quotechar)")
+        src.escape !== nothing && push!(opts, "escape=$(src.escape)")
+        src.nullstr !== nothing && push!(opts, "nullstr=$(src.nullstr)")
+        src.auto_detect != true && push!(opts, "auto_detect=$(src.auto_detect)")
+        src.sample_size !== nothing && push!(opts, "sample_size=$(src.sample_size)")
+        return isempty(opts) ? src.path : "$(src.path) (" * join(opts, ", ") * ")"
+    end
     src isa String    && return src
     return string(src)
 end

@@ -112,7 +112,7 @@ execute!(ctx, "INSERT INTO revenue_by_year VALUES (2022, 0.0)")
 ```julia
 r = query(ctx, "SELECT * FROM revenue_by_year ORDER BY year")
 
-println("Took $(r.elapsed_ms) ms, got $(nrow(r)) rows")
+println("Took $(r.elapsed_ns) ns, got $(nrow(r)) rows")
 # Took 0.12 ms, got 3 rows
 
 r[1, :year]          # → 2022    (direct indexing, no conversion needed)

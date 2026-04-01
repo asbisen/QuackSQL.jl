@@ -122,24 +122,10 @@ and release the connection back to the pool if needed.
 function _with_conn(f::Function, ctx::QueryContext)
     ctx._closed && throw(QueryError("QueryContext has been closed."))
     if ctx._pool !== nothing
-        # Pool path: acquire → apply sources → call f → release
+        # Pool path: acquire! already calls _ensure_sources_applied!, which
+        # reads pool.sources — a mirror of ctx.sources kept in sync by
+        # register!/deregister!.  No secondary source check is needed here.
         with_connection(ctx._pool) do conn
-            # Snapshot ctx.sources under the lock so the iteration below does
-            # not race with concurrent register!/deregister! calls.
-            snapshot = lock(ctx._lock) do
-                collect(ctx.sources)
-            end
-            for (name, src) in snapshot
-                needs_apply = lock(ctx._pool._lock) do
-                    !(name in get(ctx._pool._applied, conn, Set{String}()))
-                end
-                if needs_apply
-                    _register_source!(conn, name, src)
-                    lock(ctx._pool._lock) do
-                        push!(get!(ctx._pool._applied, conn, Set{String}()), name)
-                    end
-                end
-            end
             f(conn)
         end
     else

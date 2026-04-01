@@ -231,6 +231,44 @@ global_logger(ConsoleLogger(stderr, Logging.Warn))
         close!(ctx)
     end
 
+    @testset "stream with parameters" begin
+        ctx = QueryContext()
+        execute!(ctx, "CREATE TABLE stream_t AS SELECT generate_series AS n FROM generate_series(1,20)")
+        # positional
+        batches = collect(stream(ctx, "SELECT * FROM stream_t WHERE n > ? ORDER BY n", 10))
+        @test sum(nrow, batches) == 10
+        @test vcat(batches...)[1, :n] == 11
+        # named
+        batches2 = collect(stream(ctx, "SELECT * FROM stream_t WHERE n <= :hi ORDER BY n", hi=5))
+        @test sum(nrow, batches2) == 5
+        @test vcat(batches2...)[end, :n] == 5
+        close!(ctx)
+    end
+
+    @testset "stream on_error modes" begin
+        # :throw — default; error propagates wrapped in TaskFailedException (Channel task).
+        ctx = QueryContext(on_error=:throw)
+        ex = try collect(stream(ctx, "SELECT * FROM nonexistent_xyz")); nothing
+             catch e; e end
+        @test ex isa TaskFailedException
+        @test ex.task.exception isa QueryError
+        close!(ctx)
+
+        # :empty — failed stream emits zero batches.
+        ctx = QueryContext(on_error=:empty)
+        batches = collect(stream(ctx, "SELECT * FROM nonexistent_xyz"))
+        @test isempty(batches)
+        close!(ctx)
+
+        # :missing — failed stream emits one sentinel batch.
+        ctx = QueryContext(on_error=:missing)
+        batches = collect(stream(ctx, "SELECT * FROM nonexistent_xyz"))
+        @test length(batches) == 1
+        @test names(batches[1]) == ["result"]
+        @test ismissing(batches[1][1, :result])
+        close!(ctx)
+    end
+
     # ── Error handling modes ──────────────────────────────────────────────────
     @testset "on_error = :throw" begin
         ctx = QueryContext(on_error=:throw)
@@ -262,6 +300,20 @@ global_logger(ConsoleLogger(stderr, Logging.Warn))
         plan = explain(ctx, "SELECT 1 + 1")
         @test plan isa String
         @test !isempty(plan)
+        close!(ctx)
+    end
+
+    @testset "explain with parameters" begin
+        ctx = QueryContext()
+        execute!(ctx, "CREATE TABLE expl_t AS SELECT generate_series AS n FROM generate_series(1,10)")
+        # positional
+        plan = explain(ctx, "SELECT * FROM expl_t WHERE n > ?", 5)
+        @test plan isa String
+        @test !isempty(plan)
+        # named
+        plan2 = explain(ctx, "SELECT * FROM expl_t WHERE n > :lo", lo=3)
+        @test plan2 isa String
+        @test !isempty(plan2)
         close!(ctx)
     end
 

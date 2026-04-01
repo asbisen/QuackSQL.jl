@@ -240,10 +240,28 @@ for batch in stream(ctx, "SELECT * FROM huge_table"; batch_size=5_000)
 end
 ```
 """
-function stream(ctx::QueryContext, sql::String; batch_size::Int=10_000)::Channel{DataFrame}
+function stream(ctx::QueryContext, sql::String, args...; batch_size::Int=10_000, kwargs...)::Channel{DataFrame}
+    processed_sql, params = normalise_params(sql, args, kwargs)
     Channel{DataFrame}(2) do ch
         _with_conn(ctx) do conn
-            result       = DuckDB.execute(conn, sql)
+            result = try
+                if params === nothing
+                    DuckDB.execute(conn, processed_sql)
+                else
+                    DuckDB.execute(conn, processed_sql, params)
+                end
+            catch e
+                @error "Query failed" sql=processed_sql exception=e
+                if ctx.config.on_error === :throw
+                    throw(QueryError("Query execution failed", processed_sql, params, e))
+                elseif ctx.config.on_error === :empty
+                    return                                 # close channel, zero batches
+                else  # :missing
+                    put!(ch, DataFrame(result=[missing]))
+                    return
+                end
+            end
+
             pending      = DataFrame[]
             pending_rows = 0
             for chunk in Tables.partitions(result)
@@ -264,19 +282,22 @@ end
 # ─── explain ──────────────────────────────────────────────────────────────────
 
 """
-    explain(ctx, sql; analyze=false) → String
+    explain(ctx, sql, args...; analyze=false, kwargs...) → String
 
 Return the DuckDB query plan for `sql` as a formatted string.
 Set `analyze=true` to include actual execution statistics (runs the query).
 
+Positional and named parameters are supported the same way as `execute`.
+
 ```julia
-println(explain(ctx, "SELECT * FROM trips WHERE passenger_count > 2"))
+println(explain(ctx, "SELECT * FROM trips WHERE passenger_count > ?", 2))
 ```
 """
-function explain(ctx::QueryContext, sql::String; analyze::Bool=false)::String
+function explain(ctx::QueryContext, sql::String, args...; analyze::Bool=false, kwargs...)::String
+    processed_sql, params = normalise_params(sql, args, kwargs)
     prefix = analyze ? "EXPLAIN ANALYZE " : "EXPLAIN "
     _with_conn(ctx) do conn
-        df, _ = _run(conn, ctx.config, "$prefix$sql")
+        df, _ = _run(conn, ctx.config, "$prefix$processed_sql", params)
         (ncol(df) == 0 || nrow(df) == 0) && return ""
         join(df[!, end], "\n")
     end

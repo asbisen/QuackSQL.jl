@@ -216,13 +216,13 @@ end
 Drain the pool channel and close every connection.
 """
 function close!(pool::ConnectionPool)
-    borrowed_count = lock(pool._lock) do
-        pool._closed && return 0
+    in_use_conns = lock(pool._lock) do
+        pool._closed && return DuckDB.DB[]
         pool._closed = true
-        length(pool._in_use)
+        collect(keys(pool._in_use))
     end
 
-    # Drain and close all connections currently in the channel
+    # Drain and close all idle connections currently in the channel.
     while isready(pool.channel)
         conn = take!(pool.channel)
         try close(conn) catch end
@@ -231,7 +231,20 @@ function close!(pool::ConnectionPool)
             delete!(pool._pending_drops, conn)
         end
     end
-    @debug "Pool: closed all available connections" borrowed=borrowed_count
+
+    # Close connections that are currently checked out so they are not leaked
+    # if the borrowing task never calls release!.  If release! is eventually
+    # called, it sees _closed=true and exits early; the extra close(conn) there
+    # is a harmless no-op.
+    for conn in in_use_conns
+        try close(conn) catch end
+        lock(pool._lock) do
+            delete!(pool._applied, conn)
+            delete!(pool._pending_drops, conn)
+        end
+    end
+
+    @debug "Pool: closed" borrowed=length(in_use_conns)
 end
 
 """

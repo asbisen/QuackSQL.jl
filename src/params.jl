@@ -206,13 +206,3 @@ function _bind_named(sql::String, named_params::Base.Pairs)::Tuple{String, Vecto
     return (sql_out, values)
 end
 
-"""
-    count_placeholders(sql) → Int
-
-Count the number of `?` placeholders in a SQL string (excluding those inside
-string literals).
-"""
-function count_placeholders(sql::String)::Int
-    # Simple heuristic: count '?' not preceded by another '?'
-    count(==('?'), sql)
-end

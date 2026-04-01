@@ -132,7 +132,7 @@ function query(ctx::QueryContext, sql::String, args...; kwargs...)::QueryResult
     processed_sql, params = normalise_params(sql, args, kwargs)
     _with_conn(ctx) do conn
         df, elapsed = _run(conn, ctx.config, processed_sql, params)
-        QueryResult(df, elapsed, sql)
+        QueryResult(df, elapsed, processed_sql)
     end
 end
 
@@ -241,6 +241,7 @@ end
 ```
 """
 function stream(ctx::QueryContext, sql::String, args...; batch_size::Int=10_000, kwargs...)::Channel{DataFrame}
+    batch_size > 0 || throw(ArgumentError("batch_size must be a positive integer, got $batch_size"))
     processed_sql, params = normalise_params(sql, args, kwargs)
     Channel{DataFrame}(2) do ch
         _with_conn(ctx) do conn

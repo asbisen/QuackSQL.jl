@@ -58,6 +58,9 @@ global_logger(ConsoleLogger(stderr, Logging.Warn))
         @test r.elapsed_ns > 0
         @test elapsed_ms(r) >= 0.0
         @test DataFrame(r) isa DataFrame
+        # Named params: stored SQL must use ? placeholders, not :name tokens
+        r2 = query(ctx, "SELECT :val AS n", val=42)
+        @test r2.sql == "SELECT ? AS n"
         close!(ctx)
     end
 
@@ -217,6 +220,13 @@ global_logger(ConsoleLogger(stderr, Logging.Warn))
     end
 
     # ── Streaming ──────────────────────────────────────────────────────────────
+    @testset "stream batch_size validation" begin
+        ctx = QueryContext()
+        @test_throws ArgumentError stream(ctx, "SELECT 1"; batch_size=0)
+        @test_throws ArgumentError stream(ctx, "SELECT 1"; batch_size=-1)
+        close!(ctx)
+    end
+
     @testset "stream in batches" begin
         ctx = QueryContext()
         execute!(ctx, "CREATE TABLE big AS SELECT generate_series AS n FROM generate_series(1, 100)")

@@ -122,16 +122,23 @@ from the pool), ensure all registered sources are applied to it, call `f`,
 and release the connection back to the pool if needed.
 """
 function _with_conn(f::Function, ctx::QueryContext)
-    ctx._closed && throw(QueryError("QueryContext has been closed."))
-    if ctx._pool !== nothing
+    # Read _closed, _pool, and _conn atomically under the same lock that
+    # close!(ctx) holds when it nulls them out.  This eliminates the TOCTOU
+    # window where _closed passes but _conn is set to nothing before f(conn).
+    pool, conn = lock(ctx._lock) do
+        ctx._closed && throw(QueryError("QueryContext has been closed."))
+        (ctx._pool, ctx._conn)
+    end
+    if pool !== nothing
         # Pool path: acquire! already calls _ensure_sources_applied!, which
         # reads pool.sources — a mirror of ctx.sources kept in sync by
         # register!/deregister!.  No secondary source check is needed here.
-        with_connection(ctx._pool) do conn
-            f(conn)
+        with_connection(pool) do c
+            f(c)
         end
     else
-        # Single connection path
-        f(ctx._conn)
+        # Single connection path: conn is a local reference captured before
+        # the lock was released, so a concurrent close! cannot null it out.
+        f(conn)
     end
 end

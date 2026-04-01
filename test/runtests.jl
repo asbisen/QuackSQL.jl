@@ -150,6 +150,17 @@ global_logger(ConsoleLogger(stderr, Logging.Warn))
         close!(ctx)
     end
 
+    @testset "Unused named param error" begin
+        ctx = QueryContext()
+        # Typo in kwarg name — :status is in SQL but :stauts is passed.
+        @test_throws QueryError execute(ctx, "SELECT :status AS s"; stauts="shipped")
+        # Extra kwarg alongside a valid one.
+        @test_throws QueryError execute(ctx, "SELECT :x AS x"; x=1, typo=2)
+        # Repeated placeholder — same param used twice; should still bind cleanly.
+        @test_nowarn execute(ctx, "SELECT :x AS a, :x AS b"; x=7)
+        close!(ctx)
+    end
+
     # ── Batch execution ────────────────────────────────────────────────────────
     @testset "execute with Vector{String}" begin
         ctx = QueryContext()
@@ -211,9 +222,12 @@ global_logger(ConsoleLogger(stderr, Logging.Warn))
         execute!(ctx, "CREATE TABLE big AS SELECT generate_series AS n FROM generate_series(1, 100)")
 
         batches = collect(stream(ctx, "SELECT * FROM big ORDER BY n"; batch_size=30))
-        @test length(batches) == 4    # 30+30+30+10
+        # Native chunk iteration: batch boundaries align to DuckDB's internal
+        # vector size (~2048), so 100 rows arrive in a single chunk and a single
+        # batch.  Assert totals and ordering rather than exact batch count.
         @test sum(nrow, batches) == 100
-        @test batches[1][1, :n] == 1
+        @test vcat(batches...)[1, :n] == 1
+        @test vcat(batches...)[end, :n] == 100
         close!(ctx)
     end
 

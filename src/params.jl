@@ -202,6 +202,18 @@ function _bind_named(sql::String, named_params::Base.Pairs)::Tuple{String, Vecto
     end
 
     sql_out = String(take!(io))
+
+    # Detect kwargs provided by the caller but never referenced in the SQL.
+    # This catches typos in either the kwarg name or the :placeholder.
+    consumed = Set(order)
+    unused = [k for k in keys(named_params) if string(k) ∉ consumed]
+    if !isempty(unused)
+        throw(QueryError(
+            "Named parameter(s) provided but not referenced in SQL: $(join(sort(string.(unused)), ", "))",
+            sql, Dict(named_params), nothing
+        ))
+    end
+
     @debug "Bound named params" order=order values=values
     return (sql_out, values)
 end

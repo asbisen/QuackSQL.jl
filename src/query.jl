@@ -224,31 +224,39 @@ end
     stream(ctx, sql; batch_size=10_000) → Channel{DataFrame}
 
 Execute `sql` and return a `Channel` that emits successive `DataFrame` batches.
-Each batch has at most `batch_size` rows.  The channel is closed automatically
-when all rows have been consumed or when an error occurs.
+The channel is closed automatically when all rows have been consumed or when an
+error occurs.
+
+The SQL is executed once and results are consumed via DuckDB's native chunk
+iterator, so streaming is O(N) regardless of result size.
+
+Each batch contains at least `batch_size` rows (it may be slightly larger
+because whole DuckDB-internal chunks of ~2048 rows are accumulated before
+emitting).
 
 ```julia
 for batch in stream(ctx, "SELECT * FROM huge_table"; batch_size=5_000)
     process(batch)
 end
 ```
-
-!!! note
-    The SQL is wrapped in a sub-query with `LIMIT … OFFSET …` which requires the
-    query engine to re-execute the underlying plan for each batch.  For best
-    performance on very large scans, consider using DuckDB's native export or
-    `COPY` instead.
 """
 function stream(ctx::QueryContext, sql::String; batch_size::Int=10_000)::Channel{DataFrame}
     Channel{DataFrame}(2) do ch
-        offset = 0
-        while true
-            batch_sql = "SELECT * FROM ($sql) AS __stream_q__ LIMIT $batch_size OFFSET $offset"
-            batch = execute(ctx, batch_sql)
-            nrow(batch) == 0 && break
-            put!(ch, batch)
-            offset += batch_size
-            nrow(batch) < batch_size && break
+        _with_conn(ctx) do conn
+            result       = DuckDB.execute(conn, sql)
+            pending      = DataFrame[]
+            pending_rows = 0
+            for chunk in Tables.partitions(result)
+                chunk_df = DataFrame(chunk)
+                push!(pending, chunk_df)
+                pending_rows += nrow(chunk_df)
+                if pending_rows >= batch_size
+                    put!(ch, vcat(pending...))
+                    empty!(pending)
+                    pending_rows = 0
+                end
+            end
+            pending_rows > 0 && put!(ch, vcat(pending...))
         end
     end
 end

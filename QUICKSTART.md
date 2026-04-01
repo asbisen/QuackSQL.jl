@@ -1,21 +1,28 @@
 # QuackSQL.jl — Quickstart
 
-QuackSQL wraps [DuckDB](https://duckdb.org/) with a clean Julia API: parameterized queries, DataFrame sources, streaming, transactions, and connection pooling — all through a single `QueryContext`.
+QuackSQL wraps [DuckDB](https://duckdb.org/) with a clean Julia API: parameterized queries,
+DataFrame sources, streaming, transactions, and connection pooling — all through a single
+`QueryContext`.
+
+> **How to use this guide**
+> The examples in sections 2–8 are a single continuous session. Paste them top-to-bottom
+> in a Julia REPL (or a notebook) and every line will work. Sections 9 and 10 are
+> self-contained and can be run independently.
 
 ---
 
 ## Contents
 
 1. [Installation](#1-installation)
-2. [Opening a context](#2-opening-a-context)
+2. [Setup — sample data and context](#2-setup--sample-data-and-context)
 3. [Running queries](#3-running-queries)
 4. [Parameterized queries](#4-parameterized-queries)
 5. [Registering data sources](#5-registering-data-sources)
 6. [Transactions](#6-transactions)
 7. [Streaming large results](#7-streaming-large-results)
 8. [Query plans](#8-query-plans)
-9. [Error handling modes](#9-error-handling-modes)
-10. [Connection pooling](#10-connection-pooling)
+9. [Error handling modes](#9-error-handling-modes)  ← self-contained
+10. [Connection pooling](#10-connection-pooling)      ← self-contained
 11. [Configuration reference](#11-configuration-reference)
 
 ---
@@ -28,32 +35,41 @@ Pkg.add("QuackSQL")
 ```
 
 ```julia
-using QuackSQL
+using QuackSQL, DataFrames
 ```
 
 ---
 
-## 2. Opening a context
+## 2. Setup — sample data and context
 
-`QueryContext` is the central object. Create it once, use it for all queries, close it when done.
+Paste this block once. It creates the in-memory context and sample DataFrames used
+throughout sections 3–8.
 
 ```julia
-# In-memory database (default)
+using QuackSQL, DataFrames
+
+# ── Sample data ──────────────────────────────────────────────────────────────
+customers = DataFrame(
+    id      = [1, 2, 3, 4, 5],
+    name    = ["Alice", "Bob", "Charlie", "Diana", "Eve"],
+    country = ["US", "UK", "US", "CA", "UK"],
+    age     = [32,  45,  28,  35,  52],
+)
+
+orders = DataFrame(
+    id          = [101, 102, 103, 104, 105, 106],
+    customer_id = [1,   2,   1,   3,   4,   2  ],
+    status      = ["shipped", "pending", "shipped", "cancelled", "shipped", "shipped"],
+    amount      = [120.50, 89.00, 340.00, 55.75, 210.25, 67.80],
+    year        = [2023,  2023,  2024,  2024,  2024,  2024 ],
+)
+
+# ── Open an in-memory context ────────────────────────────────────────────────
 ctx = QueryContext()
 
-# Persistent file database
-ctx = QueryContext("analytics.duckdb")
-
-# Always clean up
-close!(ctx)
-```
-
-Use `with_context` for automatic cleanup — the database is closed even if an error is thrown:
-
-```julia
-with_context("analytics.duckdb") do ctx
-    execute(ctx, "SELECT count(*) FROM orders")
-end
+# Register both DataFrames as queryable SQL tables
+register!(ctx, "customers", customers)
+register!(ctx, "orders",    orders)
 ```
 
 ---
@@ -63,272 +79,431 @@ end
 ### `execute` — returns a DataFrame
 
 ```julia
-df = execute(ctx, "SELECT * FROM customers")
+execute(ctx, "SELECT * FROM customers")
+# 5×4 DataFrame
+#  Row │ id     name     country  age
+# ─────┼──────────────────────────────
+#    1 │  1  Alice    US        32
+#  ...
+```
+
+```julia
+execute(ctx, "SELECT c.name, sum(o.amount) AS total
+              FROM customers c
+              JOIN orders o ON o.customer_id = c.id
+              GROUP BY c.name
+              ORDER BY total DESC")
 ```
 
 ### `execute!` — discard the result (DDL / DML)
 
 ```julia
-execute!(ctx, "CREATE TABLE orders (id INTEGER, amount DOUBLE)")
-execute!(ctx, "INSERT INTO orders VALUES (1, 99.50)")
-execute!(ctx, "DROP TABLE IF EXISTS tmp")
+execute!(ctx, "CREATE TABLE revenue_by_year AS
+               SELECT year, round(sum(amount), 2) AS revenue
+               FROM orders
+               GROUP BY year
+               ORDER BY year")
+
+execute!(ctx, "INSERT INTO revenue_by_year VALUES (2022, 0.0)")
 ```
 
-### `query` — returns a `QueryResult` with metadata
+### `query` — returns a `QueryResult` with timing metadata
 
 ```julia
-r = query(ctx, "SELECT * FROM orders")
+r = query(ctx, "SELECT * FROM revenue_by_year ORDER BY year")
 
-println(r.elapsed_ms)   # execution time in milliseconds
-println(nrow(r))        # number of rows
-df = DataFrame(r)       # convert to plain DataFrame
-r[1, :amount]           # index directly — works like a DataFrame
+println("Took $(r.elapsed_ms) ms, got $(nrow(r)) rows")
+# Took 0.12 ms, got 3 rows
+
+r[1, :year]          # → 2022    (direct indexing, no conversion needed)
+df = DataFrame(r)    # convert to a plain DataFrame when required
 ```
 
-### Batch execution — share one connection across multiple statements
+### Batch execution — multiple statements on one connection
 
 ```julia
+# DDL and query share the same connection, so the temp table is visible
 df = execute(ctx, [
-    "CREATE TEMP TABLE t AS SELECT generate_series AS n FROM generate_series(1, 100)",
-    "SELECT avg(n) AS mean FROM t",
+    "CREATE TEMP TABLE top_customers AS
+         SELECT customer_id, sum(amount) AS spend
+         FROM orders GROUP BY customer_id ORDER BY spend DESC LIMIT 3",
+    "SELECT c.name, t.spend
+     FROM top_customers t JOIN customers c ON c.id = t.customer_id
+     ORDER BY t.spend DESC",
 ])
-# df contains the result of the last statement
+# df is the result of the last statement
 ```
 
 ---
 
 ## 4. Parameterized queries
 
-Always use parameters instead of string interpolation — QuackSQL passes them to DuckDB's prepared statement engine.
+Always use parameters instead of string interpolation — QuackSQL passes them to
+DuckDB's prepared statement engine, eliminating SQL injection risk.
 
 ### Positional parameters (`?`)
 
 ```julia
-df = execute(ctx, "SELECT * FROM orders WHERE status = ? AND amount > ?", "shipped", 50.0)
+# Single filter
+execute(ctx, "SELECT * FROM orders WHERE status = ?", "shipped")
+
+# Multiple filters
+execute(ctx, "SELECT * FROM orders WHERE status = ? AND amount > ?",
+        "shipped", 100.0)
 ```
 
 ### Named parameters (`:name`)
 
 ```julia
-df = execute(ctx, "SELECT * FROM orders WHERE status = :status AND amount > :min",
-             status="shipped", min=50.0)
+execute(ctx, "SELECT * FROM orders WHERE status = :status AND amount > :min",
+        status="shipped", min=100.0)
 ```
 
-Both styles work identically with `execute!`, `query`, `stream`, and `explain`.
-Mixing positional and named parameters in the same query is an error.
+### Parameters with `execute!` and `query`
+
+```julia
+execute!(ctx, "INSERT INTO revenue_by_year VALUES (:yr, :rev)", yr=2021, rev=4321.00)
+
+r = query(ctx, "SELECT * FROM revenue_by_year WHERE year >= ?", 2022)
+println("$(nrow(r)) rows returned in $(r.elapsed_ms) ms")
+```
+
+> Mixing positional and named parameters in the same query raises a `QueryError`.
 
 ---
 
 ## 5. Registering data sources
 
-Register external data under a SQL name so you can query it with standard SQL.
-
-### DataFrame
+### DataFrame (already shown in Setup)
 
 ```julia
-df_customers = DataFrame(id=[1,2,3], name=["Alice","Bob","Charlie"], country=["US","UK","US"])
+# Replace an existing source by registering under the same name
+updated_customers = DataFrame(
+    id      = [1, 2, 3, 4, 5, 6],
+    name    = ["Alice", "Bob", "Charlie", "Diana", "Eve", "Frank"],
+    country = ["US", "UK", "US", "CA", "UK", "US"],
+    age     = [32, 45, 28, 35, 52, 41],
+)
+register!(ctx, "customers", updated_customers)
 
-register!(ctx, "customers", df_customers)
-
-execute(ctx, "SELECT * FROM customers WHERE country = ?", "US")
+execute(ctx, "SELECT count(*) AS n FROM customers")
+# n = 6
 ```
 
-### CSV file or glob
+### CSV file
 
 ```julia
-register!(ctx, "events", "data/events_2024.csv")
-register!(ctx, "all_events", "data/events_*.csv")   # glob
+# Write a temp CSV using DuckDB, then register it back as a view
+csv_path = joinpath(tempdir(), "orders_export.csv")
+execute!(ctx, "COPY orders TO '$(csv_path)' (FORMAT CSV, HEADER true)")
 
-execute(ctx, "SELECT count(*) FROM events")
+register!(ctx, "orders_csv", csv_path)
+execute(ctx, "SELECT count(*) AS n FROM orders_csv")
+# n = 6
 ```
 
-### Parquet file or glob
+### Parquet file
 
 ```julia
-register!(ctx, "trips", "yellow_tripdata_2024.parquet")
-register!(ctx, "logs",  "logs/*.parquet")
+parquet_path = joinpath(tempdir(), "orders_export.parquet")
+execute!(ctx, "COPY orders TO '$(parquet_path)' (FORMAT PARQUET)")
 
-# Merge files with different schemas by column name
-register!(ctx, "logs", "logs/*.parquet"; union_by_name=true)
+register!(ctx, "orders_parquet", parquet_path)
+execute(ctx, "SELECT avg(amount) AS avg_amount FROM orders_parquet")
 ```
 
-### Attached DuckDB database
+### Parquet glob with `union_by_name`
 
 ```julia
-register!(ctx, "archive", "archive.duckdb")
+# Write two parquet files with slightly different schemas
+parquet_a = joinpath(tempdir(), "orders_2023.parquet")
+parquet_b = joinpath(tempdir(), "orders_2024.parquet")
+execute!(ctx, "COPY (SELECT * FROM orders WHERE year = 2023) TO '$(parquet_a)' (FORMAT PARQUET)")
+execute!(ctx, "COPY (SELECT * FROM orders WHERE year = 2024) TO '$(parquet_b)' (FORMAT PARQUET)")
 
-# Cross-database query
-execute(ctx, "SELECT * FROM archive.main.orders WHERE year = ?", 2023)
+glob_pattern = joinpath(tempdir(), "orders_*.parquet")
+register!(ctx, "all_orders_pq", glob_pattern; union_by_name=true)
+execute(ctx, "SELECT year, count(*) AS n FROM all_orders_pq GROUP BY year ORDER BY year")
 ```
 
-### Bulk registration with pairs
+### Bulk registration with pair syntax
 
 ```julia
+extra = DataFrame(id=[7,8], name=["Grace","Hank"], country=["DE","FR"], age=[29,38])
+
 register!(ctx,
-    "customers" => df_customers,
-    "trips"     => "trips.parquet",
-    "events"    => "events/*.csv",
+    "customers"  => extra,               # replaces current customers source
+    "orders_csv" => csv_path,
 )
 ```
 
 ### Inspecting and removing sources
 
 ```julia
-list_sources(ctx)        # DataFrame with columns: name, type, info
+list_sources(ctx)
+# 5×3 DataFrame with columns: name | type | info
 
-deregister!(ctx, "trips")
+deregister!(ctx, "orders_csv")
+deregister!(ctx, "all_orders_pq")
+list_sources(ctx)
 ```
 
 ---
 
 ## 6. Transactions
 
-Wrap multiple writes in a transaction. On success it commits; on any error it rolls back and re-throws.
+Wrap multiple writes in a transaction. Commits on success; rolls back and re-throws on
+any error.
 
 ```julia
+# Setup: create an accounts table
+execute!(ctx, "CREATE TABLE accounts (id INTEGER, balance DOUBLE)")
+
+# Successful transaction — both inserts commit together
 transaction(ctx) do tx
     execute!(tx, "INSERT INTO accounts VALUES (?, ?)", 1, 1_000.0)
-    execute!(tx, "INSERT INTO accounts VALUES (?, ?)", 2, 2_000.0)
-    execute!(tx, "UPDATE balances SET total = total + ? WHERE id = ?", 500.0, 1)
+    execute!(tx, "INSERT INTO accounts VALUES (?, ?)", 2, 2_500.0)
 end
+
+execute(ctx, "SELECT * FROM accounts")
+# 2 rows: id=1 balance=1000.0, id=2 balance=2500.0
 ```
 
-The `tx` handle supports the same `execute` and `execute!` signatures as a regular context.
+```julia
+# Failed transaction — rollback leaves accounts unchanged
+try
+    transaction(ctx) do tx
+        execute!(tx, "UPDATE accounts SET balance = balance - ? WHERE id = ?", 500.0, 1)
+        error("payment gateway timeout")   # simulated failure
+    end
+catch e
+    println("Transaction rolled back: $(e.msg)")
+end
+
+execute(ctx, "SELECT * FROM accounts ORDER BY id")
+# Still 2 rows with original balances — rollback preserved state
+```
 
 ---
 
 ## 7. Streaming large results
 
-`stream` executes a query once and yields results as a `Channel` of DataFrames. Memory usage is bounded to `batch_size` rows regardless of total result size.
+`stream` executes the query once and yields successive `DataFrame` batches through a
+`Channel`. Memory stays bounded to roughly `batch_size` rows regardless of total
+result size.
 
 ```julia
-for batch in stream(ctx, "SELECT * FROM huge_table ORDER BY ts"; batch_size=5_000)
-    process(batch)   # each batch is a plain DataFrame
-end
+# Create a 50 000-row table to stream
+execute!(ctx, "CREATE TABLE events AS
+               SELECT
+                   (random() * 1000)::INTEGER AS user_id,
+                   (now()::TIMESTAMP - INTERVAL (random() * 365) DAY) AS ts,
+                   ['click','view','purchase'][1 + (random()*2)::INTEGER] AS action
+               FROM generate_series(1, 50_000)")
 ```
 
-Parameterized streaming works the same way:
-
 ```julia
-for batch in stream(ctx, "SELECT * FROM events WHERE user_id = ?", user_id; batch_size=10_000)
-    process(batch)
-end
+# Count total rows across all batches
+total_rows = sum(nrow(batch) for batch in stream(ctx, "SELECT * FROM events"; batch_size=10_000))
+println("Processed $total_rows rows")   # → 50000
 ```
 
-Collect all batches into one DataFrame when size allows:
+```julia
+# Accumulate per-action counts across batches
+action_counts = Dict{String,Int}()
+for batch in stream(ctx, "SELECT * FROM events"; batch_size=10_000)
+    for action in batch.action
+        action_counts[action] = get(action_counts, action, 0) + 1
+    end
+end
+println(action_counts)
+```
 
 ```julia
-df = vcat(collect(stream(ctx, "SELECT * FROM medium_table"))...)
+# Parameterized streaming — filter inside the query
+user_id = 42
+batches = collect(stream(ctx,
+    "SELECT * FROM events WHERE user_id = ? ORDER BY ts",
+    user_id; batch_size=5_000))
+
+println("$(sum(nrow, batches)) events for user $user_id")
+```
+
+```julia
+# Collect all batches when the result fits in memory
+df = vcat(collect(stream(ctx, "SELECT action, count(*) AS n
+                               FROM events GROUP BY action"))...)
 ```
 
 ---
 
 ## 8. Query plans
 
-`explain` returns the DuckDB query plan as a formatted string — useful for tuning slow queries.
+`explain` returns the DuckDB query plan as a formatted string — useful for diagnosing
+slow queries.
 
 ```julia
-println(explain(ctx, "SELECT * FROM trips WHERE passenger_count > ?", 2))
+# Static plan (does not run the query)
+println(explain(ctx,
+    "SELECT c.name, sum(o.amount)
+     FROM customers c JOIN orders o ON o.customer_id = c.id
+     WHERE o.status = ?
+     GROUP BY c.name",
+    "shipped"))
 ```
 
-Pass `analyze=true` to include actual row counts and timing (runs the query):
+```julia
+# Annotated plan with actual row counts and timing (runs the query)
+println(explain(ctx,
+    "SELECT action, count(*) FROM events GROUP BY action";
+    analyze=true))
+```
 
 ```julia
-println(explain(ctx, "SELECT avg(fare) FROM trips GROUP BY vendor_id"; analyze=true))
+# Close the session when done with sections 3–8
+close!(ctx)
 ```
 
 ---
 
 ## 9. Error handling modes
 
-Control what happens when a query fails by setting `on_error` on the context.
+*Self-contained — paste from `using QuackSQL, DataFrames` below.*
 
-| Mode        | Behaviour                                              |
-|-------------|--------------------------------------------------------|
-| `:throw`    | Raises `QueryError` (default)                          |
-| `:empty`    | Returns an empty `DataFrame` (or zero stream batches)  |
-| `:missing`  | Returns a one-row `DataFrame` with a `missing` sentinel|
+Control what happens when a query fails via the `on_error` keyword.
+
+| Mode       | Behaviour                                             |
+|------------|-------------------------------------------------------|
+| `:throw`   | Raises `QueryError` (default)                         |
+| `:empty`   | Returns an empty `DataFrame` (or zero stream batches) |
+| `:missing` | Returns a one-row `DataFrame` with a `missing` value  |
 
 ```julia
-# Strict (default)
+using QuackSQL, DataFrames
+
+# ── :throw (default) ─────────────────────────────────────────────────────────
 ctx = QueryContext(on_error=:throw)
-execute(ctx, "SELECT * FROM nonexistent")   # throws QueryError
 
-# Graceful degradation — useful in pipelines that tolerate missing data
-ctx = QueryContext(on_error=:empty)
-df = execute(ctx, "SELECT * FROM nonexistent")   # → empty DataFrame
+try
+    execute(ctx, "SELECT * FROM nonexistent_table")
+catch e
+    println(typeof(e))   # QuackSQL.QueryError
+    println(e.sql)       # SELECT * FROM nonexistent_table
+    println(e.cause)     # the underlying DuckDB error
+end
 
-# Sentinel value — lets callers detect failure without try/catch
-ctx = QueryContext(on_error=:missing)
-df = execute(ctx, "SELECT * FROM nonexistent")
-ismissing(df[1, :result])   # → true
+close!(ctx)
 ```
 
-`QueryError` carries the original SQL, bound parameters, and the underlying DuckDB exception:
+```julia
+# ── :empty ────────────────────────────────────────────────────────────────────
+ctx = QueryContext(on_error=:empty)
+
+df = execute(ctx, "SELECT * FROM nonexistent_table")
+println(nrow(df))   # 0
+println(ncol(df))   # 0
+
+batches = collect(stream(ctx, "SELECT * FROM nonexistent_table"))
+println(length(batches))   # 0
+
+close!(ctx)
+```
 
 ```julia
-try
-    execute(ctx, "SELECT * FROM nonexistent")
-catch e::QueryError
-    println(e.sql)     # the failing SQL
-    println(e.cause)   # the DuckDB exception
-end
+# ── :missing ──────────────────────────────────────────────────────────────────
+ctx = QueryContext(on_error=:missing)
+
+df = execute(ctx, "SELECT * FROM nonexistent_table")
+println(size(df))              # (1, 1)
+println(names(df))             # ["result"]
+println(ismissing(df[1,1]))   # true
+
+close!(ctx)
 ```
 
 ---
 
 ## 10. Connection pooling
 
-Use a pooled context when multiple Julia tasks will query concurrently. Each task gets its own DuckDB connection; registered sources are applied automatically to every connection.
+*Self-contained — paste from `using QuackSQL, DataFrames` below.*
+
+Use a pooled context when multiple Julia tasks query concurrently. Each task gets its own
+DuckDB connection; registered sources are applied automatically to every connection in the
+pool.
 
 ```julia
-# pool_size connections, all pointing at the same database
-ctx = QueryContext("analytics.duckdb"; pool_size=8, threads=4, readonly=true)
+using QuackSQL, DataFrames
 
-# Each @spawn task gets its own connection from the pool
-results = map(1:20) do i
-    Threads.@spawn execute(ctx, "SELECT * FROM trips WHERE vendor_id = ?", i)
-end
+# ── Build a persistent database to share across tasks ────────────────────────
+db_path = joinpath(tempdir(), "pool_demo.duckdb")
 
-df = vcat(fetch.(results)...)
-close!(ctx)
+setup_ctx = QueryContext(db_path)
+execute!(setup_ctx, "CREATE TABLE IF NOT EXISTS sales AS
+                     SELECT
+                         (random() * 10 + 1)::INTEGER AS region_id,
+                         round((random() * 1000)::NUMERIC, 2) AS amount
+                     FROM generate_series(1, 100_000)")
+close!(setup_ctx)
 ```
 
-Sources registered on a pooled context propagate to every connection automatically:
+```julia
+# ── Open the same database with a 4-connection pool ───────────────────────────
+ctx = QueryContext(db_path; pool_size=4)
+
+# Register a DataFrame source — propagates to all pool connections automatically
+regions = DataFrame(id=[1,2,3,4,5,6,7,8,9,10],
+                    name=["North","South","East","West","Central",
+                          "NE","NW","SE","SW","Mid"])
+register!(ctx, "regions", regions)
+```
 
 ```julia
-register!(ctx, "customers", df_customers)   # available to all pool connections
+# ── Run 20 queries concurrently across the pool ───────────────────────────────
+tasks = map(1:10) do region_id
+    Threads.@spawn execute(ctx,
+        "SELECT r.name, count(*) AS n, round(sum(s.amount), 2) AS revenue
+         FROM sales s JOIN regions r ON r.id = s.region_id
+         WHERE s.region_id = ?
+         GROUP BY r.name",
+        region_id)
+end
+
+results = vcat(fetch.(tasks)...)
+sort!(results, :revenue; rev=true)
+println(results)
+
+close!(ctx)
 ```
 
 ---
 
 ## 11. Configuration reference
 
-All options can be passed as keyword arguments to `QueryContext` or `QueryConfig`.
+All options are keyword arguments to `QueryContext`.
 
 ```julia
 ctx = QueryContext("data.duckdb";
-    threads      = 4,           # DuckDB worker threads (0 = auto)
-    memory_limit = "4GB",       # cap DuckDB's memory use
-    readonly     = true,        # open file in read-only mode
-    extensions   = ["httpfs",   # DuckDB extensions to INSTALL and LOAD
+    threads      = 4,            # DuckDB worker threads (0 = auto-detect)
+    memory_limit = "4GB",        # cap DuckDB's memory use
+    readonly     = true,         # open file in read-only mode
+    extensions   = ["httpfs",    # DuckDB extensions to INSTALL + LOAD on connect
                     "spatial"],
-    init_sql     = [            # SQL run on every new connection
+    init_sql     = [             # SQL executed on every new connection
         "SET timezone = 'UTC'",
         "SET enable_progress_bar = false",
     ],
-    on_error     = :empty,      # :throw | :empty | :missing
-    pool_size    = 4,           # >1 enables connection pooling
+    on_error     = :empty,       # :throw | :empty | :missing
+    pool_size    = 4,            # >1 enables connection pooling
 )
+close!(ctx)
 ```
 
-Or build a `QueryConfig` separately and reuse it:
-
-```julia
-cfg = QueryConfig(threads=8, memory_limit="8GB", on_error=:empty)
-
-with_context("warehouse.duckdb"; threads=cfg.threads,
-             memory_limit=cfg.memory_limit, on_error=cfg.on_error) do ctx
-    execute(ctx, "SELECT sum(revenue) FROM sales")
-end
-```
+| Option         | Default    | Description                                      |
+|----------------|------------|--------------------------------------------------|
+| `threads`      | `0`        | DuckDB worker threads; `0` = DuckDB default      |
+| `memory_limit` | `""`       | e.g. `"4GB"`; empty = DuckDB default             |
+| `readonly`     | `false`    | Open file databases in read-only mode            |
+| `extensions`   | `String[]` | Extensions to `INSTALL` and `LOAD`               |
+| `init_sql`     | `String[]` | SQL run on every new connection                  |
+| `on_error`     | `:throw`   | `:throw`, `:empty`, or `:missing`                |
+| `pool_size`    | `1`        | Connection pool size; `1` = single connection    |

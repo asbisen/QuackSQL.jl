@@ -39,6 +39,7 @@ mutable struct QueryContext
     _pool::Union{ConnectionPool, Nothing}    # nil when pool_size == 1
     sources::Dict{String, Any}
     _closed::Bool
+    _lock::ReentrantLock                     # guards sources and _closed
 
     function QueryContext(
         db_path::String = ":memory:";
@@ -51,10 +52,10 @@ mutable struct QueryContext
         if pool_size == 1
             conn = _open_db(db_path, config)
             _apply_config!(conn, config)
-            ctx = new(db_path, config, conn, nothing, Dict{String,Any}(), false)
+            ctx = new(db_path, config, conn, nothing, Dict{String,Any}(), false, ReentrantLock())
         else
             pool = ConnectionPool(db_path; size=pool_size, kwargs...)
-            ctx = new(db_path, config, nothing, pool, Dict{String,Any}(), false)
+            ctx = new(db_path, config, nothing, pool, Dict{String,Any}(), false, ReentrantLock())
         end
 
         finalizer(_finalizer_close!, ctx)
@@ -75,16 +76,16 @@ Release all DuckDB connections held by this context.  After calling `close!`,
 the context must not be used.
 """
 function close!(ctx::QueryContext)
-    ctx._closed && return
-    ctx._closed = true
-    if ctx._conn !== nothing
-        try close(ctx._conn) catch end
+    conn, pool = lock(ctx._lock) do
+        ctx._closed && return (nothing, nothing)
+        ctx._closed = true
+        c, p = ctx._conn, ctx._pool
         ctx._conn = nothing
-    end
-    if ctx._pool !== nothing
-        close!(ctx._pool)
         ctx._pool = nothing
+        (c, p)
     end
+    conn !== nothing && try close(conn) catch end
+    pool !== nothing && close!(pool)
     @debug "QueryContext closed" db_path=ctx.db_path
 end
 
@@ -123,9 +124,12 @@ function _with_conn(f::Function, ctx::QueryContext)
     if ctx._pool !== nothing
         # Pool path: acquire → apply sources → call f → release
         with_connection(ctx._pool) do conn
-            # Sync pool's source registry with context's registry
-            # (register! on ctx also adds to pool, but belt-and-suspenders)
-            for (name, src) in ctx.sources
+            # Snapshot ctx.sources under the lock so the iteration below does
+            # not race with concurrent register!/deregister! calls.
+            snapshot = lock(ctx._lock) do
+                collect(ctx.sources)
+            end
+            for (name, src) in snapshot
                 needs_apply = lock(ctx._pool._lock) do
                     !(name in get(ctx._pool._applied, conn, Set{String}()))
                 end

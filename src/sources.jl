@@ -74,9 +74,7 @@ register!(ctx,
 function register!(ctx::QueryContext, name::String, source; union_by_name::Bool=false)
     ctx._closed && throw(QueryError("QueryContext has been closed."))
 
-    had_previous = haskey(ctx.sources, name)
-    previous_source = had_previous ? ctx.sources[name] : nothing
-
+    # Compute actual_source before acquiring the lock (pure logic, no I/O).
     actual_source = if union_by_name && source isa String
         _looks_like_parquet(source) || throw(ArgumentError(
             "union_by_name is only supported for Parquet/glob sources, got: $source"
@@ -85,7 +83,14 @@ function register!(ctx::QueryContext, name::String, source; union_by_name::Bool=
     else
         source
     end
-    ctx.sources[name] = actual_source
+
+    # Atomically read the previous value and install the new one.
+    had_previous, previous_source = lock(ctx._lock) do
+        prev = haskey(ctx.sources, name)
+        prev_src = prev ? ctx.sources[name] : nothing
+        ctx.sources[name] = actual_source
+        (prev, prev_src)
+    end
 
     if ctx._pool !== nothing
         pool = ctx._pool
@@ -170,11 +175,15 @@ VIEW; for attached databases this issues DETACH.
 function deregister!(ctx::QueryContext, name::String)
     ctx._closed && throw(QueryError("QueryContext has been closed."))
 
-    if !haskey(ctx.sources, name)
+    src, found = lock(ctx._lock) do
+        haskey(ctx.sources, name) || return (nothing, false)
+        (pop!(ctx.sources, name), true)
+    end
+
+    if !found
         @warn "Attempted to deregister unknown source" name=name
         return
     end
-    src = pop!(ctx.sources, name)
 
     if ctx._pool !== nothing
         pool = ctx._pool
@@ -227,11 +236,14 @@ end
 Return a one-row-per-source `DataFrame` with columns `name`, `type`, and `info`.
 """
 function list_sources(ctx::QueryContext)::DataFrame
+    snapshot = lock(ctx._lock) do
+        collect(ctx.sources)
+    end
     rows = [(
         name = k,
         type = _source_type_label(v),
         info = _source_info(v)
-    ) for (k, v) in ctx.sources]
+    ) for (k, v) in snapshot]
     isempty(rows) && return DataFrame(name=String[], type=String[], info=String[])
     return DataFrame(rows)
 end

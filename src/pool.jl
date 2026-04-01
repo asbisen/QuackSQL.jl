@@ -245,12 +245,9 @@ See `register!` on `QueryContext` for supported source types.
 function register!(pool::ConnectionPool, name::String, source)
     lock(pool._lock) do
         pool._closed && throw(QueryError("ConnectionPool has been closed."))
-    end
-
-    pool.sources[name] = source
-    # Invalidate per-connection tracking so all existing connections
-    # will re-apply the full source list on next acquisition.
-    lock(pool._lock) do
+        pool.sources[name] = source
+        # Invalidate per-connection tracking so all existing connections
+        # will re-apply the full source list on next acquisition.
         for conn in keys(pool._applied)
             delete!(pool._applied[conn], name)
         end

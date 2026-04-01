@@ -46,6 +46,15 @@ function QueryConfig(;
     if !(on_error in (:throw, :empty, :missing))
         throw(ArgumentError("on_error must be :throw, :empty, or :missing; got :$(on_error)"))
     end
+    for ext in extensions
+        if !occursin(r"^[A-Za-z][A-Za-z0-9_-]*$", ext)
+            throw(ArgumentError(
+                "Invalid extension name: $(repr(ext)). " *
+                "Extension names must start with a letter and contain only " *
+                "letters, digits, underscores, or hyphens."
+            ))
+        end
+    end
     QueryConfig(threads, memory_limit, readonly, extensions, init_sql, on_error)
 end
 
@@ -85,8 +94,8 @@ function _apply_config!(conn::DuckDB.DB, config::QueryConfig)
     end
     for ext in config.extensions
         try
-            DuckDB.execute(conn, "INSTALL $(ext)")
-            DuckDB.execute(conn, "LOAD $(ext)")
+            DuckDB.execute(conn, "INSTALL '$(ext)'")
+            DuckDB.execute(conn, "LOAD '$(ext)'")
             @debug "Loaded extension" extension=ext
         catch e
             @warn "Failed to load DuckDB extension" extension=ext exception=e

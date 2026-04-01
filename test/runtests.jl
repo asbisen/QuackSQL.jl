@@ -23,6 +23,12 @@ global_logger(ConsoleLogger(stderr, Logging.Warn))
 
     @testset "QueryConfig validation" begin
         @test_throws ArgumentError QueryConfig(on_error=:invalid)
+        # Extension names with SQL metacharacters must be rejected at config time.
+        @test_throws ArgumentError QueryConfig(extensions=["foo; DROP TABLE bar"])
+        @test_throws ArgumentError QueryConfig(extensions=["../evil"])
+        @test_throws ArgumentError QueryConfig(extensions=[""])
+        # Valid names must be accepted.
+        @test_nowarn QueryConfig(extensions=["httpfs", "json", "delta", "aws-sdk"])
     end
 
     # ── Basic in-memory queries ───────────────────────────────────────────────

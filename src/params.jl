@@ -52,9 +52,7 @@ keyword argument.
 function _bind_named(sql::String, named_params::Base.Pairs)::Tuple{String, Vector}
     values   = Any[]
     order    = String[]
-    io = IOBuffer()
-    try
-
+    io       = IOBuffer()
     is_word_char(c::Char) = isletter(c) || isdigit(c) || c == '_'
 
     i = firstindex(sql)
@@ -217,9 +215,5 @@ function _bind_named(sql::String, named_params::Base.Pairs)::Tuple{String, Vecto
 
     @debug "Bound named params" order=order values=values
     return (sql_out, values)
-
-    finally
-        close(io)
-    end
 end
 

@@ -247,9 +247,10 @@ function stream(ctx::QueryContext, sql::String, args...; batch_size::Int=10_000,
         _with_conn(ctx) do conn
             result = try
                 if params === nothing
-                    DuckDB.execute(conn, processed_sql)
+                    DuckDB.DBInterface.execute(conn, processed_sql, DuckDB.StreamResult)
                 else
-                    DuckDB.execute(conn, processed_sql, params)
+                    stmt = DuckDB.DBInterface.prepare(conn, processed_sql, DuckDB.StreamResult)
+                    DuckDB.DBInterface.execute(stmt, params)
                 end
             catch e
                 @error "Query failed" sql=processed_sql exception=e

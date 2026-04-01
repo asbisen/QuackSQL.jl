@@ -308,3 +308,50 @@ function register!(pool::ConnectionPool, name::String, source)
 
     @debug "Pool: registered source" name=name type=typeof(source)
 end
+
+"""
+    deregister!(pool, name)
+
+Remove a named data source from the pool.  Idle connections are updated
+immediately; in-use connections have the drop queued for the next
+acquisition.
+"""
+function deregister!(pool::ConnectionPool, name::String)
+    src, found = lock(pool._lock) do
+        pool._closed && throw(QueryError("ConnectionPool has been closed."))
+        haskey(pool.sources, name) || return (nothing, false)
+        (pop!(pool.sources, name), true)
+    end
+
+    if !found
+        @warn "Attempted to deregister unknown source" name=name
+        return
+    end
+
+    available = DuckDB.DB[]
+    while isready(pool.channel)
+        push!(available, take!(pool.channel))
+    end
+
+    try
+        for conn in available
+            _deregister_source!(conn, name, src)
+            lock(pool._lock) do
+                delete!(get!(pool._applied, conn, Set{String}()), name)
+            end
+        end
+        lock(pool._lock) do
+            for conn in keys(pool._in_use)
+                pending = get!(pool._pending_drops, conn, Dict{String, Any}())
+                pending[name] = src
+                delete!(get!(pool._applied, conn, Set{String}()), name)
+            end
+        end
+    finally
+        for conn in available
+            put!(pool.channel, conn)
+        end
+    end
+
+    @debug "Pool: deregistered source" name=name
+end

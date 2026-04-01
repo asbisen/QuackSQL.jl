@@ -85,60 +85,9 @@ function register!(ctx::QueryContext, name::String, source; union_by_name::Bool=
     end
 
     if ctx._pool !== nothing
-        pool = ctx._pool
-
-        # ctx.sources IS pool.sources (shared object); use pool._lock as the
-        # single authoritative guard so _ensure_sources_applied! stays consistent.
-        had_previous, previous_source = lock(pool._lock) do
-            prev = haskey(ctx.sources, name)
-            prev_src = prev ? ctx.sources[name] : nothing
-            ctx.sources[name] = actual_source
-            (prev, prev_src)
-        end
-
-        available = DuckDB.DB[]
-        while isready(pool.channel)
-            push!(available, take!(pool.channel))
-        end
-
-        try
-            # Apply changes immediately to currently idle connections.
-            for conn in available
-                if had_previous
-                    try
-                        _deregister_source!(conn, name, previous_source)
-                    catch e
-                        @warn "Failed to deregister replaced pooled source" name=name exception=e
-                    end
-                    lock(pool._lock) do
-                        delete!(get!(pool._applied, conn, Set{String}()), name)
-                    end
-                end
-
-                _register_source!(conn, name, actual_source)
-                lock(pool._lock) do
-                    push!(get!(pool._applied, conn, Set{String}()), name)
-                end
-            end
-
-            # For checked-out connections, queue replacement cleanup and force
-            # source re-application when they are next released/acquired.
-            lock(pool._lock) do
-                for conn in keys(pool._in_use)
-                    if had_previous
-                        pending = get!(pool._pending_drops, conn, Dict{String, Any}())
-                        pending[name] = previous_source
-                    end
-                    delete!(get!(pool._applied, conn, Set{String}()), name)
-                end
-            end
-        finally
-            for conn in available
-                put!(pool.channel, conn)
-            end
-        end
-
-        @debug "Source registered (pooled context)" name=name type=typeof(actual_source)
+        # Delegate entirely to the pool — it owns the source registry and all
+        # connection tracking when a pool is present.
+        register!(ctx._pool, name, actual_source)
         return
     end
 
@@ -180,48 +129,9 @@ function deregister!(ctx::QueryContext, name::String)
     ctx._closed && throw(QueryError("QueryContext has been closed."))
 
     if ctx._pool !== nothing
-        pool = ctx._pool
-
-        # ctx.sources IS pool.sources; use pool._lock as the single guard.
-        src, found = lock(pool._lock) do
-            haskey(ctx.sources, name) || return (nothing, false)
-            (pop!(ctx.sources, name), true)
-        end
-
-        if !found
-            @warn "Attempted to deregister unknown source" name=name
-            return
-        end
-
-        available = DuckDB.DB[]
-        while isready(pool.channel)
-            push!(available, take!(pool.channel))
-        end
-
-        try
-            # Apply deregistration immediately to idle pooled connections.
-            for conn in available
-                _deregister_source!(conn, name, src)
-                lock(pool._lock) do
-                    delete!(get!(pool._applied, conn, Set{String}()), name)
-                end
-            end
-
-            # Queue deregistration for currently checked-out connections.
-            lock(pool._lock) do
-                for conn in keys(pool._in_use)
-                    pending = get!(pool._pending_drops, conn, Dict{String, Any}())
-                    pending[name] = src
-                    delete!(get!(pool._applied, conn, Set{String}()), name)
-                end
-            end
-        finally
-            for conn in available
-                put!(pool.channel, conn)
-            end
-        end
-
-        @debug "Source deregistered (pooled context)" name=name
+        # Delegate entirely to the pool — it owns the source registry and all
+        # connection tracking when a pool is present.
+        deregister!(ctx._pool, name)
         return
     end
 
@@ -415,20 +325,17 @@ end
 
 function _deregister_source!(conn::DuckDB.DB, name::String, source)
     qname = "\"$(escape_identifier(name))\""
-    if source isa DataFrame
-        try DuckDB.execute(conn, "DROP VIEW IF EXISTS $qname")
-        catch e; @debug "DROP VIEW failed during deregister" name=name exception=e end
-        try DuckDB.execute(conn, "DROP TABLE IF EXISTS $qname")
-        catch e; @debug "DROP TABLE failed during deregister" name=name exception=e end
-    elseif source isa ParquetSource
-        try DuckDB.execute(conn, "DROP VIEW IF EXISTS $qname")
-        catch e; @debug "DROP VIEW failed during deregister" name=name exception=e end
-    elseif source isa String && any(endswith(lowercase(source), e) for e in DUCKDB_EXTS)
+    if source isa String && any(endswith(lowercase(source), e) for e in DUCKDB_EXTS)
         try DuckDB.execute(conn, "DETACH $qname")
         catch e; @debug "DETACH failed during deregister" name=name exception=e end
     else
         try DuckDB.execute(conn, "DROP VIEW IF EXISTS $qname")
         catch e; @debug "DROP VIEW failed during deregister" name=name exception=e end
+        # DataFrames may be registered as tables (fallback path) — drop both.
+        if source isa DataFrame
+            try DuckDB.execute(conn, "DROP TABLE IF EXISTS $qname")
+            catch e; @debug "DROP TABLE failed during deregister" name=name exception=e end
+        end
     end
 end
 
@@ -451,17 +358,6 @@ function julia_type_to_duckdb(T::Type)::String
     T <: Dates.Date    && return "DATE"
     T <: Dates.DateTime && return "TIMESTAMP"
     return "VARCHAR"
-end
-
-# Safe SQL string literal (escapes single quotes)
-function _sql_literal(v)::String
-    v === missing  && return "NULL"
-    v isa Bool     && return v ? "TRUE" : "FALSE"
-    v isa Number   && return string(v)
-    v isa Dates.Date     && return "'$(v)'"
-    v isa Dates.DateTime && return "'$(v)'"
-    # For strings and everything else: escape single quotes
-    return "'$(replace(string(v), "'" => "''"))'"
 end
 
 # Escape a SQL identifier (double-quote any embedded double-quotes)

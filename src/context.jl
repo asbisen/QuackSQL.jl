@@ -55,7 +55,9 @@ mutable struct QueryContext
             ctx = new(db_path, config, conn, nothing, Dict{String,Any}(), false, ReentrantLock())
         else
             pool = ConnectionPool(db_path; size=pool_size, kwargs...)
-            ctx = new(db_path, config, nothing, pool, Dict{String,Any}(), false, ReentrantLock())
+            # Share pool.sources directly — ctx.sources IS pool.sources.
+            # No manual sync needed; pool._lock is the authoritative guard.
+            ctx = new(db_path, config, nothing, pool, pool.sources, false, ReentrantLock())
         end
 
         finalizer(_finalizer_close!, ctx)

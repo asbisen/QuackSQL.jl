@@ -84,19 +84,16 @@ function register!(ctx::QueryContext, name::String, source; union_by_name::Bool=
         source
     end
 
-    # Atomically read the previous value and install the new one.
-    had_previous, previous_source = lock(ctx._lock) do
-        prev = haskey(ctx.sources, name)
-        prev_src = prev ? ctx.sources[name] : nothing
-        ctx.sources[name] = actual_source
-        (prev, prev_src)
-    end
-
     if ctx._pool !== nothing
         pool = ctx._pool
 
-        lock(pool._lock) do
-            pool.sources[name] = actual_source
+        # ctx.sources IS pool.sources (shared object); use pool._lock as the
+        # single authoritative guard so _ensure_sources_applied! stays consistent.
+        had_previous, previous_source = lock(pool._lock) do
+            prev = haskey(ctx.sources, name)
+            prev_src = prev ? ctx.sources[name] : nothing
+            ctx.sources[name] = actual_source
+            (prev, prev_src)
         end
 
         available = DuckDB.DB[]
@@ -145,7 +142,14 @@ function register!(ctx::QueryContext, name::String, source; union_by_name::Bool=
         return
     end
 
-    # Eagerly apply to the live single connection (if any)
+    # Single-connection path: ctx.sources is its own dict, guarded by ctx._lock.
+    had_previous, previous_source = lock(ctx._lock) do
+        prev = haskey(ctx.sources, name)
+        prev_src = prev ? ctx.sources[name] : nothing
+        ctx.sources[name] = actual_source
+        (prev, prev_src)
+    end
+
     if ctx._conn !== nothing
         if had_previous
             try
@@ -175,21 +179,18 @@ VIEW; for attached databases this issues DETACH.
 function deregister!(ctx::QueryContext, name::String)
     ctx._closed && throw(QueryError("QueryContext has been closed."))
 
-    src, found = lock(ctx._lock) do
-        haskey(ctx.sources, name) || return (nothing, false)
-        (pop!(ctx.sources, name), true)
-    end
-
-    if !found
-        @warn "Attempted to deregister unknown source" name=name
-        return
-    end
-
     if ctx._pool !== nothing
         pool = ctx._pool
 
-        lock(pool._lock) do
-            haskey(pool.sources, name) && delete!(pool.sources, name)
+        # ctx.sources IS pool.sources; use pool._lock as the single guard.
+        src, found = lock(pool._lock) do
+            haskey(ctx.sources, name) || return (nothing, false)
+            (pop!(ctx.sources, name), true)
+        end
+
+        if !found
+            @warn "Attempted to deregister unknown source" name=name
+            return
         end
 
         available = DuckDB.DB[]
@@ -224,6 +225,17 @@ function deregister!(ctx::QueryContext, name::String)
         return
     end
 
+    # Single-connection path: ctx.sources is its own dict, guarded by ctx._lock.
+    src, found = lock(ctx._lock) do
+        haskey(ctx.sources, name) || return (nothing, false)
+        (pop!(ctx.sources, name), true)
+    end
+
+    if !found
+        @warn "Attempted to deregister unknown source" name=name
+        return
+    end
+
     if ctx._conn !== nothing
         _deregister_source!(ctx._conn, name, src)
     end
@@ -236,7 +248,8 @@ end
 Return a one-row-per-source `DataFrame` with columns `name`, `type`, and `info`.
 """
 function list_sources(ctx::QueryContext)::DataFrame
-    snapshot = lock(ctx._lock) do
+    lk = ctx._pool !== nothing ? ctx._pool._lock : ctx._lock
+    snapshot = lock(lk) do
         collect(ctx.sources)
     end
     rows = [(

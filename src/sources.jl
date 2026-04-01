@@ -357,19 +357,28 @@ function _sanitize_for_duckdb(df::DataFrame)::DataFrame
 end
 
 function _register_dataframe_fallback!(conn::DuckDB.DB, name::String, df::DataFrame)
-    # Use a quoted identifier to avoid SQL injection through column names
-    DuckDB.execute(conn, "DROP TABLE IF EXISTS \"$(escape_identifier(name))\"")
-    cols = names(df)
+    qname = "\"$(escape_identifier(name))\""
+    DuckDB.execute(conn, "DROP TABLE IF EXISTS $qname")
+
+    cols  = names(df)
     types = [eltype(df[!, c]) for c in cols]
     col_defs = join(
         ["\"$(escape_identifier(c))\" $(julia_type_to_duckdb(t))" for (c, t) in zip(cols, types)],
         ", "
     )
-    DuckDB.execute(conn, "CREATE TEMPORARY TABLE \"$(escape_identifier(name))\" ($col_defs)")
+    DuckDB.execute(conn, "CREATE TEMPORARY TABLE $qname ($col_defs)")
 
-    for row in eachrow(df)
-        vals = join([_sql_literal(row[c]) for c in cols], ", ")
-        DuckDB.execute(conn, "INSERT INTO \"$(escape_identifier(name))\" VALUES ($vals)")
+    appender = DuckDB.Appender(conn, name)
+    try
+        for row in eachrow(df)
+            for col in cols
+                DuckDB.append(appender, row[col])
+            end
+            DuckDB.end_row(appender)
+        end
+        DuckDB.flush(appender)
+    finally
+        DuckDB.close(appender)
     end
     @debug "DataFrame registered (fallback)" name=name rows=nrow(df)
 end

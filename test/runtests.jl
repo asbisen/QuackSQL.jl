@@ -85,10 +85,10 @@ global_logger(ConsoleLogger(stderr, Logging.Warn))
             FROM orders o
             JOIN customers c ON o.customer_id = c.id
             GROUP BY c.name
-            ORDER BY total DESC
+            ORDER BY total DESC, c.name ASC
         """)
         @test size(df, 1) == 3
-        @test df[1, :name] == "Alice"    # Alice has 100+200=300
+        @test df[1, :name] == "Alice"    # Alice has 100+200=300, ties Charlie; 'A' < 'C' breaks tie
         @test df[1, :total] == 300.0
         close!(ctx)
     end

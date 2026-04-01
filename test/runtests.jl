@@ -786,4 +786,98 @@ global_logger(ConsoleLogger(stderr, Logging.Warn))
         close!(ctx)
     end
 
+    # ── @query / @query! / @stream macros ────────────────────────────────────
+    @testset "@query — no interpolation" begin
+        ctx = QueryContext()
+        df = @query ctx "SELECT 1 + 1 AS two"
+        @test df[1, :two] == 2
+        close!(ctx)
+    end
+
+    @testset "@query — single interpolation" begin
+        ctx = QueryContext()
+        execute!(ctx, "CREATE TABLE t AS SELECT generate_series AS n FROM generate_series(1,10)")
+        limit = 3
+        df = @query ctx "SELECT n FROM t ORDER BY n LIMIT $limit"
+        @test nrow(df) == 3
+        @test df[1, :n] == 1
+        close!(ctx)
+    end
+
+    @testset "@query — multiple interpolations" begin
+        ctx = QueryContext()
+        execute!(ctx, "CREATE TABLE t AS SELECT generate_series AS n FROM generate_series(1,20)")
+        lo, hi = 5, 15
+        df = @query ctx "SELECT n FROM t WHERE n >= $lo AND n <= $hi ORDER BY n"
+        @test nrow(df) == 11
+        @test df[1, :n] == 5
+        @test df[end, :n] == 15
+        close!(ctx)
+    end
+
+    @testset "@query — expression interpolation" begin
+        ctx = QueryContext()
+        execute!(ctx, "CREATE TABLE t AS SELECT generate_series AS n FROM generate_series(1,10)")
+        base = 3
+        df = @query ctx "SELECT n FROM t WHERE n > $(base * 2) ORDER BY n"
+        @test df[1, :n] == 7
+        close!(ctx)
+    end
+
+    @testset "@query! — DML with interpolation" begin
+        # Note: $interpolations become bound ? parameters, so they work for
+        # VALUES but not for identifier positions (table names, column names).
+        ctx = QueryContext()
+        execute!(ctx, "CREATE TABLE log (msg VARCHAR, code INTEGER)")
+        msg  = "job_start"
+        code = 42
+        @query! ctx "INSERT INTO log VALUES ($msg, $code)"
+        df = execute(ctx, "SELECT msg, code FROM log")
+        @test df[1, :msg]  == "job_start"
+        @test df[1, :code] == 42
+        close!(ctx)
+    end
+
+    @testset "@stream — no interpolation" begin
+        ctx = QueryContext()
+        execute!(ctx, "CREATE TABLE big AS SELECT generate_series AS n FROM generate_series(1,100)")
+        total = sum(nrow(b) for b in @stream ctx "SELECT * FROM big")
+        @test total == 100
+        close!(ctx)
+    end
+
+    @testset "@stream — interpolation with batch_size" begin
+        ctx = QueryContext()
+        execute!(ctx, "CREATE TABLE big AS SELECT generate_series AS n FROM generate_series(1,100)")
+        lo = 10
+        bs = 20
+        total = sum(nrow(b) for b in @stream ctx "SELECT * FROM big WHERE n >= $lo" batch_size=bs)
+        @test total == 91
+        close!(ctx)
+    end
+
+    @testset "@stream — batch_size as variable" begin
+        ctx = QueryContext()
+        execute!(ctx, "CREATE TABLE big AS SELECT generate_series AS n FROM generate_series(1,50)")
+        batch_size = 10
+        total = sum(nrow(b) for b in @stream ctx "SELECT * FROM big" batch_size=batch_size)
+        @test total == 50
+        close!(ctx)
+    end
+
+    @testset "@query multiline triple-quoted string" begin
+        ctx = QueryContext()
+        execute!(ctx, "CREATE TABLE orders AS SELECT generate_series AS id, (random()*100)::INT AS amount FROM generate_series(1,20)")
+        status = "shipped"
+        min_amt = 0
+        df = @query ctx """
+            SELECT id, amount
+            FROM   orders
+            WHERE  amount >= $min_amt
+            ORDER  BY id
+        """
+        @test nrow(df) == 20
+        close!(ctx)
+    end
+
 end  # @testset "QuackSQL.jl"

@@ -24,6 +24,7 @@ DataFrame sources, streaming, transactions, and connection pooling — all throu
 9. [Error handling modes](#9-error-handling-modes)  ← self-contained
 10. [Connection pooling](#10-connection-pooling)      ← self-contained
 11. [Configuration reference](#11-configuration-reference)
+12. [SQL macros — @query, @query!, @stream](#12-sql-macros--query-query-stream)  ← self-contained
 
 ---
 
@@ -509,3 +510,114 @@ close!(ctx)
 | `init_sql`     | `String[]` | SQL run on every new connection                  |
 | `on_error`     | `:throw`   | `:throw`, `:empty`, or `:missing`                |
 | `pool_size`    | `1`        | Connection pool size; `1` = single connection    |
+
+---
+
+## 12. SQL macros — @query, @query!, @stream
+
+*Self-contained — paste from `using QuackSQL, DataFrames` below.*
+
+The `@query`, `@query!`, and `@stream` macros let you write SQL with standard
+Julia `$variable` / `$(expression)` interpolation. Each interpolation is replaced
+with a `?` placeholder at **compile time** and the value is passed to DuckDB's
+prepared statement engine at **run time** — injection-safe by construction, with
+no manual placeholder counting.
+
+> **Note:** `$interpolations` work for SQL *values* (strings, numbers, dates).
+> They cannot be used for *identifiers* such as table or column names, because
+> SQL prepared statements do not support parameterized identifiers.
+
+### `@query` — returns a DataFrame
+
+```julia
+using QuackSQL, DataFrames
+
+ctx = QueryContext()
+execute!(ctx, "CREATE TABLE orders AS
+    SELECT i AS id,
+           ['shipped','pending','cancelled'][1+(i%3)] AS status,
+           round(random()*500, 2) AS amount
+    FROM generate_series(1, 50) t(i)")
+
+status  = "shipped"
+min_amt = 100.0
+
+df = @query ctx """
+    SELECT id, status, amount
+    FROM   orders
+    WHERE  status = $status
+      AND  amount > $min_amt
+    ORDER  BY amount DESC
+"""
+println(df)
+```
+
+Multiline strings, arbitrary expressions, and multiple variables all work:
+
+```julia
+lo, hi = 10, 30
+
+df = @query ctx "SELECT * FROM orders WHERE id BETWEEN $lo AND $hi"
+
+# Expressions are evaluated at the call site
+df = @query ctx "SELECT * FROM orders WHERE id > $(lo * 2 - 5)"
+```
+
+### `@query!` — discard result (DML)
+
+Use `@query!` for INSERT, UPDATE, DELETE, and other statements where the
+return value is not needed.
+
+```julia
+msg  = "nightly_run"
+code = 0
+execute!(ctx, "CREATE TABLE log (msg VARCHAR, code INTEGER)")
+
+@query! ctx "INSERT INTO log VALUES ($msg, $code)"
+
+execute(ctx, "SELECT * FROM log")
+```
+
+### `@stream` — streaming with interpolation
+
+`@stream` accepts the same `batch_size` keyword as `stream`.
+
+```julia
+# Stream all rows for a specific status in 15-row batches
+status     = "shipped"
+batch_size = 15
+
+row_count = 0
+for batch in @stream ctx "SELECT * FROM orders WHERE status = $status" batch_size=batch_size
+    global row_count += nrow(batch)
+end
+println("Shipped orders: $row_count")
+```
+
+```julia
+# batch_size can itself be a variable
+bs = 20
+total = sum(nrow(b) for b in @stream ctx "SELECT * FROM orders" batch_size=bs)
+println("Total orders: $total")
+
+close!(ctx)
+```
+
+### Comparison with explicit parameters
+
+The three styles are exactly equivalent — choose what reads best:
+
+```julia
+status = "shipped"
+min_amt = 100.0
+
+# Macro — reads like plain SQL
+df = @query ctx "SELECT * FROM orders WHERE status = $status AND amount > $min_amt"
+
+# Positional — explicit but requires counting ?
+df = execute(ctx, "SELECT * FROM orders WHERE status = ? AND amount > ?", status, min_amt)
+
+# Named — verbose but self-documenting
+df = execute(ctx, "SELECT * FROM orders WHERE status = :status AND amount > :min",
+             status=status, min=min_amt)
+```

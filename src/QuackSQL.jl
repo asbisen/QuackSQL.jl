@@ -80,6 +80,7 @@ include("pool.jl")      # ConnectionPool, acquire!, release!, with_connection
 include("context.jl")   # QueryContext, with_context, _with_conn
 include("sources.jl")   # register!, deregister!, list_sources, _register_source!
 include("query.jl")     # execute, execute!, query, transaction, stream, explain
+include("macros.jl")    # @query, @query!, @stream
 
 # ── Public exports ────────────────────────────────────────────────────────────
 
@@ -100,5 +101,8 @@ export register!, deregister!, list_sources
 
 # Query execution
 export execute, execute!, query, transaction, stream, explain
+
+# Macros
+export @query, @query!, @stream
 
 end # module QuackSQL

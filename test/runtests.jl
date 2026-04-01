@@ -355,6 +355,19 @@ global_logger(ConsoleLogger(stderr, Logging.Warn))
         close!(pool)
     end
 
+    @testset "register!(pool) replaces old source eagerly" begin
+        # Bug fix: register!(pool, ...) must drop the old view on idle
+        # connections, not just invalidate _applied tracking.
+        pool = ConnectionPool(":memory:"; size=1)
+        register!(pool, "t", DataFrame(x=[1, 2, 3]))
+        register!(pool, "t", DataFrame(x=[9, 9, 9]))   # replace
+        result = with_connection(pool) do conn
+            DuckDB.execute(conn, "SELECT sum(x) AS s FROM t") |> DataFrame
+        end
+        @test result[1, :s] == 27   # 9+9+9, not 1+2+3
+        close!(pool)
+    end
+
     @testset "with_connection" begin
         pool = ConnectionPool(":memory:"; size=2)
         result = with_connection(pool) do conn

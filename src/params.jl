@@ -53,6 +53,7 @@ function _bind_named(sql::String, named_params::Base.Pairs)::Tuple{String, Vecto
     values   = Any[]
     order    = String[]
     io = IOBuffer()
+    try
 
     is_word_char(c::Char) = isletter(c) || isdigit(c) || c == '_'
 
@@ -216,5 +217,9 @@ function _bind_named(sql::String, named_params::Base.Pairs)::Tuple{String, Vecto
 
     @debug "Bound named params" order=order values=values
     return (sql_out, values)
+
+    finally
+        close(io)
+    end
 end
 

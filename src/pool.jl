@@ -250,20 +250,61 @@ end
 """
     register!(pool, name, source)
 
-Register a named data source with the pool.
-The source will be lazily applied to each connection on first use.
+Register a named data source with the pool.  Idle connections are updated
+immediately; in-use connections have the old source queued for removal and
+the new source applied on next acquisition.
 
 See `register!` on `QueryContext` for supported source types.
 """
 function register!(pool::ConnectionPool, name::String, source)
-    lock(pool._lock) do
+    had_previous, previous_source = lock(pool._lock) do
         pool._closed && throw(QueryError("ConnectionPool has been closed."))
+        prev     = haskey(pool.sources, name)
+        prev_src = prev ? pool.sources[name] : nothing
         pool.sources[name] = source
-        # Invalidate per-connection tracking so all existing connections
-        # will re-apply the full source list on next acquisition.
-        for conn in keys(pool._applied)
-            delete!(pool._applied[conn], name)
+        (prev, prev_src)
+    end
+
+    # Drain idle connections so we can update them immediately.
+    available = DuckDB.DB[]
+    while isready(pool.channel)
+        push!(available, take!(pool.channel))
+    end
+
+    try
+        for conn in available
+            if had_previous
+                try
+                    _deregister_source!(conn, name, previous_source)
+                catch e
+                    @warn "Pool: failed to deregister replaced source" name=name exception=e
+                end
+                lock(pool._lock) do
+                    delete!(get!(pool._applied, conn, Set{String}()), name)
+                end
+            end
+            _register_source!(conn, name, source)
+            lock(pool._lock) do
+                push!(get!(pool._applied, conn, Set{String}()), name)
+            end
+        end
+
+        # For in-use connections: queue the old source for removal and
+        # force re-application of the new one on next acquire/release.
+        lock(pool._lock) do
+            for conn in keys(pool._in_use)
+                if had_previous
+                    pending = get!(pool._pending_drops, conn, Dict{String, Any}())
+                    pending[name] = previous_source
+                end
+                delete!(get!(pool._applied, conn, Set{String}()), name)
+            end
+        end
+    finally
+        for conn in available
+            put!(pool.channel, conn)
         end
     end
+
     @debug "Pool: registered source" name=name type=typeof(source)
 end

@@ -416,14 +416,19 @@ end
 function _deregister_source!(conn::DuckDB.DB, name::String, source)
     qname = "\"$(escape_identifier(name))\""
     if source isa DataFrame
-        try DuckDB.execute(conn, "DROP VIEW IF EXISTS $qname") catch end
-        try DuckDB.execute(conn, "DROP TABLE IF EXISTS $qname") catch end
+        try DuckDB.execute(conn, "DROP VIEW IF EXISTS $qname")
+        catch e; @debug "DROP VIEW failed during deregister" name=name exception=e end
+        try DuckDB.execute(conn, "DROP TABLE IF EXISTS $qname")
+        catch e; @debug "DROP TABLE failed during deregister" name=name exception=e end
     elseif source isa ParquetSource
-        try DuckDB.execute(conn, "DROP VIEW IF EXISTS $qname") catch end
+        try DuckDB.execute(conn, "DROP VIEW IF EXISTS $qname")
+        catch e; @debug "DROP VIEW failed during deregister" name=name exception=e end
     elseif source isa String && any(endswith(lowercase(source), e) for e in DUCKDB_EXTS)
-        try DuckDB.execute(conn, "DETACH $qname") catch end
+        try DuckDB.execute(conn, "DETACH $qname")
+        catch e; @debug "DETACH failed during deregister" name=name exception=e end
     else
-        try DuckDB.execute(conn, "DROP VIEW IF EXISTS $qname") catch end
+        try DuckDB.execute(conn, "DROP VIEW IF EXISTS $qname")
+        catch e; @debug "DROP VIEW failed during deregister" name=name exception=e end
     end
 end
 

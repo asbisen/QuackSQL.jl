@@ -18,19 +18,48 @@
 #   end
 
 """
-    QueryContext
+    QueryContext(db_path=":memory:"; pool_size=1, kwargs...)
 
-The central state object for QuackSQL.  Create it once, register your sources,
-then execute as many queries as you need.
+Central state object for QuackSQL: holds the database connection (or pool),
+registered sources, and configuration. Create once, reuse for all queries.
 
+# Arguments
+- `db_path`: Path to a DuckDB file, or `":memory:"` for an in-memory database.
+- `pool_size`: Number of connections. Use `> 1` for concurrent/multi-threaded workloads.
+
+# Configuration kwargs (forwarded to `QueryConfig`)
+- `threads::Int`: DuckDB thread count (default: `1`).
+- `memory_limit::String`: e.g. `"2GB"` (default: `""`).
+- `readonly::Bool`: Open in read-only mode (default: `false`).
+- `extensions::Vector{String}`: DuckDB extensions to auto-load.
+- `init_sql::Vector{String}`: SQL statements run on each new connection.
+- `on_error::Symbol`: `:throw` (default), `:empty`, or `:missing`.
+
+# Fields
+- `db_path`: The database path this context was opened with.
+- `config`: The [`QueryConfig`](@ref) snapshot (immutable after construction).
+- `sources`: `Dict{String,Any}` of registered named sources.
+
+# Examples
 ```julia
-ctx = QueryContext(":memory:"; threads=4, memory_limit="2GB")
-register!(ctx, "customers", df)
-df_result = execute(ctx, "SELECT * FROM customers WHERE country = ?", "US")
-close!(ctx)
+# In-memory, default settings
+ctx = QueryContext()
+
+# File-based with tuning
+ctx = QueryContext("analytics.duckdb"; threads=4, memory_limit="4GB")
+
+# Pooled for concurrent use
+ctx = QueryContext("data.duckdb"; pool_size=8)
+
+# Automatic cleanup via do-block
+with_context("data.duckdb"; threads=2) do ctx
+    register!(ctx, "sales", df)
+    execute(ctx, "SELECT region, SUM(amount) FROM sales GROUP BY region")
+end
 ```
 
-Use `with_context` for automatic resource cleanup.
+See also [`register!`](@ref), [`execute`](@ref), [`query`](@ref),
+[`close!`](@ref), [`with_context`](@ref).
 """
 mutable struct QueryContext
     db_path::String
@@ -60,6 +89,28 @@ mutable struct QueryContext
         finalizer(_finalizer_close!, ctx)
         return ctx
     end
+end
+
+function Base.show(io::IO, ctx::QueryContext)
+    status = ctx._closed ? "closed" : "open"
+    mode   = ctx._pool !== nothing ? "pool($(ctx._pool.size))" : "single"
+    nsrc   = length(ctx.sources)
+    print(io, "QueryContext(\"$(ctx.db_path)\", $nsrc sources, $mode, $status)")
+end
+
+function Base.show(io::IO, ::MIME"text/plain", ctx::QueryContext)
+    status = ctx._closed ? "closed" : "open"
+    mode   = ctx._pool !== nothing ? "pool (size=$(ctx._pool.size))" : "single connection"
+    nsrc   = length(ctx.sources)
+    src_str = isempty(ctx.sources) ? "none" : join(sort(collect(keys(ctx.sources))), ", ")
+    cfg    = ctx.config
+    cfg_str = "threads=$(cfg.threads), memory_limit=$(isempty(cfg.memory_limit) ? "default" : cfg.memory_limit), on_error=:$(cfg.on_error)"
+    println(io, "QueryContext:")
+    println(io, "  database : $(ctx.db_path)")
+    println(io, "  mode     : $mode")
+    println(io, "  sources  : $nsrc registered [$src_str]")
+    println(io, "  config   : $cfg_str")
+    print(io,   "  status   : $status")
 end
 
 function _finalizer_close!(ctx::QueryContext)
